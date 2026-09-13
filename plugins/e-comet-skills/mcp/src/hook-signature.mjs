@@ -29,6 +29,8 @@ const secretUnavailable = (cause, code = 'ENOENT') => Object.assign(
     { code: typeof cause?.code === 'string' ? cause.code : code },
 );
 
+// Prepare authenticates injected fields, not full report text, one-use or expiry. Captured bearer
+// replay requires reconsidering the documented same-user boundary, not an implicit nonce store.
 const validPrepareFields = (fields) => {
     const keys = Object.keys(fields);
     if (keys.length === 0) return true;
@@ -154,11 +156,12 @@ const readHookSecret = async (path) => {
     }
 };
 
-// Removes the secret file only while it is still absent or wrong-sized: a complete secret that another
-// creator published meanwhile is never taken away from the signatures it already produced.
+// Removes the secret file only while it is observed absent or wrong-sized: a complete secret that
+// another creator published meanwhile is never taken away from the signatures it already produced,
+// and neither is one whose state a transient refusal (EACCES, EBUSY, EIO) left unknown.
 const removeUnlessComplete = async (path) => {
-    const current = await readHookSecret(path).catch(() => 'incomplete');
-    if (Buffer.isBuffer(current)) return;
+    const current = await readHookSecret(path).catch(() => undefined);
+    if (current !== 'absent' && current !== 'incomplete') return;
     await rm(path, { force: true }).catch(() => undefined);
 };
 
@@ -182,6 +185,9 @@ export const loadHookSecret = async ({
         if (existing === 'absent') {
             // A reader never mints a secret: an absent file proves no trusted hook signed here.
             if (!create) throw secretUnavailable();
+            // A create that keeps reporting an absent file afterwards is a storage fault, not a race
+            // another pass will settle: the same retry window bounds it as the incomplete path.
+            if (attempt >= retryLimit) throw secretUnavailable(undefined, 'EIO');
             try {
                 await mkdir(dirname(path), { recursive: true, mode: 0o700 });
                 if (process.platform !== 'win32') await chmod(dirname(path), 0o700);

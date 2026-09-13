@@ -1,22 +1,15 @@
 {
   "name": "e-comet-skills",
-  "version": "2026.9.16",
-  "description": "MCP tools for e-Comet seller analytics, live Wildberries data, and Ozon Seller promotion and analytics reports.",
+  "version": "2026.9.17",
+  "description": "MCP tools and troubleshooting guidance for e-Comet seller analytics, live Wildberries data, and Ozon Seller reports.",
   "author": {
     "name": "e-Comet",
     "url": "https://e-comet.io/"
   },
-  "homepage": "https://github.com/ShadyAV/ecomet-skills-local-mcp",
-  "repository": "https://github.com/ShadyAV/ecomet-skills-local-mcp",
+  "homepage": "https://github.com/e-comet/skills",
+  "repository": "https://github.com/e-comet/skills",
   "license": "Apache-2.0",
-  "keywords": [
-    "mcp",
-    "wildberries",
-    "wb",
-    "ozon",
-    "seller",
-    "e-comet"
-  ],
+  "keywords": ["mcp", "wildberries", "wb", "ozon", "seller", "e-comet", "troubleshooting"],
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "e-Comet MCP Tools",
@@ -24,9 +17,7 @@
     "longDescription": "Analyze e-Comet account data, get current Wildberries data, and export seller reports from Wildberries and Ozon through the user's browser.",
     "developerName": "e-Comet",
     "category": "Developer Tools",
-    "capabilities": [
-      "Interactive"
-    ],
+    "capabilities": ["Interactive"],
     "websiteURL": "https://e-comet.io/",
     "defaultPrompt": [
       "Analyze my e-Comet seller data",

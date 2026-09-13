@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { MAX_MCP_MESSAGE_BYTES, FEEDBACK_ARTIFACT_RETENTION_MS, FEEDBACK_MAX_BYTES } from '../mcp/src/config.mjs';
 import { sweepExpired } from '../mcp/src/file-retention.mjs';
 import { toolOutputSchemas, validateSchemaValue } from '../mcp/src/tool-schemas.mjs';
-import { feedbackHostAdapterMarkerSchema } from '../mcp/src/feedback-host-adapter.mjs';
+import { FEEDBACK_HOST_ADAPTER_VERSION, feedbackHostAdapterMarkerSchema } from '../mcp/src/feedback-host-adapter.mjs';
 
 const METADATA_BYTES = 64 * 1024;
 const MAX_OPERATION_BYTES = MAX_MCP_MESSAGE_BYTES + METADATA_BYTES;
@@ -13,7 +13,10 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 const HASH = /^[a-f0-9]{64}$/;
 const RECORD_NAME = /^[a-f0-9]{64}\.json$/;
 const RESIDUE_NAME = /^[a-f0-9]{64}\.(?:running|[0-9a-f-]{36}\.tmp)$/;
-const TERMINAL_STATUSES = ['uploaded', 'rejected', 'uncertain', 'not_started'];
+const TERMINAL_STATUSES = ['uploaded', 'rejected', 'uncertain', 'not_started', 'failed'];
+export const TERMINAL_DEVICE_REFUSALS = ['UPLOAD_DESTINATION_REFUSED', 'FEEDBACK_ARCHIVE_MISMATCH'];
+export const canRetryUploadOutcome = result => result?.status === 'not_started'
+    || (result?.status === 'failed' && !TERMINAL_DEVICE_REFUSALS.includes(result.error?.code));
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const encoded = value => JSON.stringify(value);
@@ -23,8 +26,24 @@ const invalid = () => failure('invalid_state');
 const missingState = error => error?.code === 'ENOENT'
     ? Object.assign(failure('state_missing'), { code: 'ENOENT', cause: error }) : error;
 const validTime = value => Number.isSafeInteger(value) && value >= 0;
+// The six transport fields claimUploadGrant returns. A pending submit operation keeps them so a
+// duplicated PreToolUse for the same call can re-emit the input it already injected; the archive
+// itself is never written here.
+const TRANSPORT_FIELDS = ['uploadUrl', 'requiredHeaders', 'objectKey', 'expiresAt', 'expectedSize', 'expectedSha256'];
+const MAX_TRANSPORT_BYTES = 64 * 1024;
+const validOperationTransport = transport => record(transport)
+    && Object.keys(transport).length === TRANSPORT_FIELDS.length
+    && TRANSPORT_FIELDS.every(key => Object.hasOwn(transport, key))
+    && typeof transport.uploadUrl === 'string' && transport.uploadUrl.length > 0
+    && record(transport.requiredHeaders)
+    && typeof transport.objectKey === 'string' && transport.objectKey.length > 0
+    && Number.isSafeInteger(transport.expiresAt) && transport.expiresAt > 0
+    && Number.isSafeInteger(transport.expectedSize) && transport.expectedSize > 0 && transport.expectedSize <= FEEDBACK_MAX_BYTES
+    && typeof transport.expectedSha256 === 'string' && HASH.test(transport.expectedSha256)
+    && Buffer.byteLength(encoded(transport), 'utf8') <= MAX_TRANSPORT_BYTES;
 const validOperationInput = input => record(input) && record(input.authored)
-    && (input.transcriptPath === undefined || typeof input.transcriptPath === 'string');
+    && (input.transcriptPath === undefined || typeof input.transcriptPath === 'string')
+    && (input.transport === undefined || validOperationTransport(input.transport));
 const validOperationResult = (binding, result) => {
     const schema = toolOutputSchemas[binding?.toolName?.split('__').at(-1)];
     return Boolean(schema && validateSchemaValue(result, schema));
@@ -33,6 +52,10 @@ const validAttempt = attempt => attempt?.version === 1 && HASH.test(attempt.sess
     && UUID.test(attempt.artifactId) && UUID.test(attempt.attemptId) && HASH.test(attempt.sha256)
     && validTime(attempt.createdAtMs) && Number.isSafeInteger(attempt.sizeBytes) && attempt.sizeBytes > 0
     && attempt.sizeBytes <= FEEDBACK_MAX_BYTES && typeof attempt.transcriptIncluded === 'boolean'
+    // Records the previous build wrote carry no callId and stay readable for the rest of their retention;
+    // only a recorded one can match a repeated PreToolUse for the same call.
+    && (attempt.callId === undefined
+        || (typeof attempt.callId === 'string' && attempt.callId.length > 0 && Buffer.byteLength(attempt.callId, 'utf8') <= 512))
     && (attempt.status === 'started'
         || (TERMINAL_STATUSES.includes(attempt.status)
             && attempt.result?.artifactId === attempt.artifactId
@@ -68,7 +91,12 @@ const readRecord = async (path, max = METADATA_BYTES, optional = false) => {
         throw missingState(error);
     }
     if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > max) throw invalid();
-    const text = await readFile(path, 'utf8');
+    let text;
+    try { text = await readFile(path, 'utf8'); }
+    catch (error) {
+        if (optional && error?.code === 'ENOENT') return undefined;
+        throw missingState(error);
+    }
     // Growth after the stat is not a record this process may act on.
     if (Buffer.byteLength(text, 'utf8') > max) throw invalid();
     try { return JSON.parse(text); }
@@ -82,10 +110,14 @@ const serialize = (value, max) => {
     if (bytes.length > max) throw invalid();
     return bytes;
 };
+// Exclusive create elects a single writer but exposes incomplete bytes until writing finishes.
+// An overlapping reader fails closed; see docs/local-agent-architecture.md#accepted-residuals.
 const writeExclusive = (path, value, max = METADATA_BYTES) =>
     writeFile(path, serialize(value, max), { flag: 'wx', mode: 0o600 });
 const replaceRecord = async (path, value, max = METADATA_BYTES) => {
     // One owner replaces its own record: publication is a single rename, never a candidate protocol.
+    // Renaming over a share-locked file would fail on Windows, which these Linux-sandbox hooks never
+    // run on: accepted residual, see docs/local-agent-architecture.md#accepted-residuals.
     const temporary = `${path.replace(/\.json$/, '')}.${randomUUID()}.tmp`;
     await writeFile(temporary, serialize(value, max), { flag: 'wx', mode: 0o600 });
     try { await rename(temporary, path); }
@@ -102,9 +134,8 @@ export class CloudFeedbackStore {
     constructor(paths, {
         now = Date.now,
         retentionMs = FEEDBACK_ARTIFACT_RETENTION_MS,
-        beforePublishTerminal,
     } = {}) {
-        Object.assign(this, { paths, now, retentionMs, beforePublishTerminal });
+        Object.assign(this, { paths, now, retentionMs });
     }
 
     get operations() { return join(this.paths.root, 'operations'); }
@@ -129,7 +160,10 @@ export class CloudFeedbackStore {
         return join(this.attempts, `${hash(encoded([hash(sessionId), artifactId]))}.json`);
     }
 
-    // Every hook run sweeps both subtrees by age alone; nothing else removes a record.
+    // Staging operations and upload attempts sweeps both record subtrees by age; explicit lifecycle
+    // transitions can also remove their own records. Canonical preparation/retirement own archive
+    // cleanup, and session destruction bounds remaining archives. See the accepted residuals in
+    // docs/local-agent-architecture.md#accepted-residuals.
     async sweep() {
         for (const directory of [this.operations, this.attempts]) {
             await sweepExpired({ directory, ownName: isOwnName, retentionMs: this.retentionMs + CLOCK_SKEW_MS });
@@ -144,7 +178,7 @@ export class CloudFeedbackStore {
             version: 1,
             state: 'pending',
             binding,
-            marker: { version: 1, operationId: randomUUID(), nonce: randomBytes(32).toString('base64url') },
+            marker: { version: FEEDBACK_HOST_ADAPTER_VERSION, operationId: randomUUID(), nonce: randomBytes(32).toString('base64url') },
             input,
             originalInputHash,
             createdAtMs: this.now(),
@@ -240,16 +274,28 @@ export class CloudFeedbackStore {
         };
     }
 
+    // Reconstructs the owner handle of a started attempt written by another process (submit Pre), so
+    // the Post that receives the device result can record the outcome with the same attemptId check.
+    async attemptHandle(sessionId, artifactId) {
+        const outcome = await this.readArtifactOutcome(sessionId, artifactId);
+        if (outcome === undefined || outcome.status !== 'started') return undefined;
+        const { result, terminal, ...intent } = outcome;
+        return { path: this.attemptPath(sessionId, artifactId), intent };
+    }
+
     async beginUploadAttempt(sessionId, metadata) {
         await this.initialize(true);
         await this.sweep();
         // Any existing attempt blocks a fresh request, except a recorded no-request refusal: it proves the
-        // uploader was never invoked, so a fresh authorization may replace it. The record is moved aside
-        // rather than deleted, so two replacers cannot both pass the exclusive create below.
+        // uploader sent nothing, so the next authorized submit may replace it. The record is moved aside
+        // rather than deleted, so two replacers cannot both pass the exclusive create below. Nothing
+        // checks what the rename moved: a started record another submit published in between can be
+        // displaced, which costs one duplicate PUT answered with 412 and one attempt reported uncertain.
+        // See the accepted residuals in docs/local-agent-architecture.md#accepted-residuals.
         const path = this.attemptPath(sessionId, metadata.artifactId);
         const existing = await this.readArtifactOutcome(sessionId, metadata.artifactId);
         if (existing !== undefined) {
-            if (!(existing.terminal && existing.result.status === 'not_started')) throw failure('upload_already_started');
+            if (!(existing.terminal && canRetryUploadOutcome(existing.result))) throw failure('upload_already_started');
             const residue = `${path.replace(/\.json$/, '')}.${randomUUID()}.tmp`;
             await rename(path, residue).catch(error => { if (error?.code !== 'ENOENT') throw error; });
             await rm(residue, { force: true }).catch(() => undefined);
@@ -286,14 +332,8 @@ export class CloudFeedbackStore {
         ) {
             throw invalid();
         }
-        await this.beforePublishTerminal?.(result);
+        // A publication failure leaves the started record uncertain, even for a known no-send result:
+        // accepted residual, see docs/local-agent-architecture.md#accepted-residuals.
         await replaceRecord(attempt.path, { ...attempt.intent, status: result.status, result, recordedAtMs: this.now() });
-    }
-
-    async releaseUploadAttempt(attempt) {
-        // Only the owner of an unstarted attempt may release it, and only before any request.
-        const persisted = await readRecord(attempt.path, METADATA_BYTES, true);
-        if (persisted?.attemptId !== attempt.intent.attemptId || persisted.status !== 'started') throw invalid();
-        await rm(attempt.path, { force: true });
     }
 }

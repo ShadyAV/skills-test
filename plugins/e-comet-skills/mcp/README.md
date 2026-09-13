@@ -3,6 +3,13 @@
 Codex and Claude launch `src/server.mjs` directly over STDIO with the `node` command. The server has no npm runtime
 dependencies; all required source modules are included in this directory. Node.js 22+ is required.
 
+From the installed plugin root, run `node mcp/src/doctor.mjs --json` to inspect bootstrap metadata and storage
+configuration without starting the MCP server. The command always prints one JSON document when collection completes;
+failed checks still exit with status 0. It does not bind the bridge port, create pairing state, remove retained files, or
+contact the extension, e-Comet, or a marketplace. The output identifies only the Node process that ran the doctor. A
+successful result does not prove that the desktop host installed or enabled this plugin, launches this copy, or runs its
+trusted hooks.
+
 The `secondary` bridge role is a normal proxy role. `peer.bridgeVersion` and `extension.version`
 identify different components; version skew alone does not establish a failure cause.
 `extensionConnected:false` means there is no effective extension route, not why it is absent.

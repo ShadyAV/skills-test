@@ -962,7 +962,6 @@ export const executeSellerReviewsJob = async ({
     authorization,
     requestSellerOperation,
     createArtifactWriter,
-    artifactJobId = undefined,
     // One byte counter per call, shared by every writer of this export (spec §4.2).
     jobBudget = { bytes: 0 },
     // Keep the same cadence as the current WB feedbacks-front report polling saga.
@@ -1001,7 +1000,6 @@ export const executeSellerReviewsJob = async ({
         },
     });
     const jobId = authorization?.job?.jobId;
-    const artifactExecutionId = artifactJobId ?? jobId;
     let lastSellerOperationSentAt;
     // The poll cadence only ever covered poll-to-poll. Create-to-first-poll, poll-to-download and
     // export-to-export had no pacing at all, which is what let a package burst at the cabinet.
@@ -1213,7 +1211,6 @@ export const executeSellerReviewsJob = async ({
                         onStart: () => withWriterOwnership(async () => {
                             if (writer) throw new Error('Seller artifact stream started more than once');
                             writer = await createArtifactWriter({
-                                jobId: artifactExecutionId,
                                 fileName: sellerArtifactName(sellerExport),
                                 mimeType: SELLER_XLSX_MIME_TYPE,
                                 signal: writerController.signal,

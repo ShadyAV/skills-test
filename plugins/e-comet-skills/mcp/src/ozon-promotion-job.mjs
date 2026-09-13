@@ -39,7 +39,6 @@ export const executeOzonPromotionJob = async ({
     dateTo,
     requestOzonPromotionReport,
     createArtifactWriter,
-    artifactJobId = authorization?.job?.jobId,
     jobBudget = { bytes: 0 },
     now = Date.now,
 }) => {
@@ -79,7 +78,6 @@ export const executeOzonPromotionJob = async ({
                 onStart: async (_metadata, signal) => {
                     if (stream.writer) throw artifactRejected(new Error('Ozon artifact stream started more than once'));
                     stream.writer = await createArtifactWriter({
-                        jobId: artifactJobId,
                         fileName: ozonPromotionArtifactName(dateFrom, dateTo),
                         mimeType: XLSX_MIME_TYPE,
                         validateXlsx: true,
@@ -138,7 +136,6 @@ export const executeOzonPromotionPackageJob = async ({
     periods,
     requestOzonReportPackage,
     createArtifactWriter,
-    artifactJobId = authorization?.job?.jobId,
     jobBudget = { bytes: 0 },
     now = Date.now,
 }) => {
@@ -164,7 +161,6 @@ export const executeOzonPromotionPackageJob = async ({
         family: 'promotion',
         jobType: 'ozon_seller_promotion_reports',
         items: periods,
-        artifactJobId,
         packageDeadline,
         requestOzonReportPackage,
         createArtifactWriter,

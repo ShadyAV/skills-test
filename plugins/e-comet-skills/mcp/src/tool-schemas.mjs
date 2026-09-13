@@ -12,7 +12,7 @@ import {
 } from './config.mjs';
 import { PEER_REJECTION_CODES } from './connection-state.mjs';
 import { FEEDBACK_DIAGNOSTIC_OPERATIONS, FEEDBACK_DIAGNOSTIC_ERROR_TYPES, FEEDBACK_DIAGNOSTIC_SYSTEM_CODES, FEEDBACK_DIAGNOSTIC_MODULES, FEEDBACK_DIAGNOSTIC_REASONS } from './feedback-diagnostics.mjs';
-import { feedbackHostAdapterMarkerSchema } from './feedback-host-adapter.mjs';
+import { feedbackCloudTransportSchema, feedbackHostAdapterMarkerSchema } from './feedback-host-adapter.mjs';
 import {
     EXTENSION_UPDATE_URL,
     FETCH_ERROR_CODES,
@@ -23,6 +23,8 @@ import {
 import { OZON_EXTENSION_OUTDATED_REASON, OZON_PROMOTION_TERMINAL_CODE_STAGES } from './tool-errors.mjs';
 import { MAX_OZON_REPORT_PACKAGE_ITEMS } from './ozon-report-package-domain.mjs';
 import { OZON_PACKAGE_STOP_REASONS } from './ozon-report-package-result.mjs';
+import { DIAGNOSTIC_STATES } from './diagnostic-facts.mjs';
+import { feedbackDeviceSnapshotSchema } from './feedback-device-diagnostics.mjs';
 
 const string = { type: 'string' };
 const boolean = { type: 'boolean' };
@@ -43,6 +45,7 @@ const object = (properties, required = [], additionalProperties = false) => ({
 
 const array = (items, extra = {}) => ({ type: 'array', items, ...extra });
 const objectUnion = (...schemas) => ({ type: 'object', oneOf: schemas });
+const described = (schema, description) => ({ ...schema, description });
 const liveAggregateSchemas = (schema) => [
     {
         ...schema,
@@ -180,6 +183,13 @@ const liveBaseProperties = {
     storageWarnings,
 };
 
+const browserJobRejectionSchema = objectUnion(
+    object({ schemaVersion: { const: 1 }, reason: { const: 'invalid_job' }, diagnostic: { type: 'string', enum: ['job_type', 'jobs_count', 'descriptor_type', 'descriptor_shape', 'date_from', 'date_to_or_range', 'claims_iat_or_jti'] } }, ['schemaVersion', 'reason']),
+    ...['public_key_not_configured', 'user_not_available', 'invalid_format', 'invalid_algorithm', 'invalid_signature', 'issuer_mismatch', 'audience_mismatch', 'subject_mismatch', 'expired', 'token_reuse', 'ecomet_not_authenticated', 'activation_storage_unavailable', 'unknown']
+        .map((reason) => object({ schemaVersion: { const: 1 }, reason: { const: reason } }, ['schemaVersion', 'reason']))
+);
+const browserJobRejectionDetailsSchema = object({ browserJobRejection: browserJobRejectionSchema }, ['browserJobRejection']);
+
 export const toolErrorSchema = object({
     ok: { const: false },
     code: string,
@@ -189,10 +199,10 @@ export const toolErrorSchema = object({
         enum: ['arguments', 'handoff', 'extension', 'authorization', 'execution', 'storage', 'images', 'seller', 'local'],
     },
     retryable: boolean,
-    details: object({
+    details: objectUnion(object({
         operation: { const: 'create_result' },
         systemCode: { type: 'string', enum: ['EEXIST', 'EACCES', 'EPERM', 'ENOSPC', 'EDQUOT', 'EROFS', 'ENOTDIR', 'EBUSY'] },
-    }, ['operation', 'systemCode']),
+    }, ['operation', 'systemCode']), browserJobRejectionDetailsSchema),
     resultPath: string,
     storageWarnings,
 }, ['ok', 'code', 'message', 'stage', 'retryable']);
@@ -401,81 +411,119 @@ const peerRejectionSchema = object(
     {
         // Derived, never restated: a hand-copied list would let a new rejection code ship as tool output that
         // fails this very schema, in the one tool an operator reads when the bridge is already wedged.
-        code: { type: 'string', enum: Object.values(PEER_REJECTION_CODES) },
-        since: string,
-        retryAt: string,
+        code: described({ type: 'string', enum: Object.values(PEER_REJECTION_CODES) }, 'Current safe classification of the continuous authenticated-peer rejection streak.'),
+        since: described(string, 'ISO timestamp when the current continuous peer-rejection streak began; omitted when no safe time is available.'),
+        retryAt: described(string, 'ISO timestamp of the scheduled peer reconnect; omitted when no retry is armed.'),
     },
     ['code']
 );
 
 const storageTargetStatusSchema = objectUnion(
-    object({ state: { const: 'ready' }, backend: { type: 'string', enum: ['plugin_data', 'application_data', 'override'] } }, ['state', 'backend']),
-    object(
+    described(object({ state: described({ const: 'ready' }, 'Configuration resolved a target; this does not prove the target is writable.'), backend: described({ type: 'string', enum: ['plugin_data', 'application_data', 'override'] }, 'Configuration source that resolved this target, without exposing its filesystem path.') }, ['state', 'backend']), 'A configured target resolved successfully; no write was attempted.'),
+    described(object(
         {
-            state: { const: 'unavailable' },
-            reason: {
+            state: described({ const: 'unavailable' }, 'Configuration could not resolve this target; this does not identify a host-installation failure.'),
+            reason: described({
                 type: 'string',
                 enum: ['plugin_data_missing', 'plugin_data_invalid', 'plugin_data_conflict', 'application_data_invalid', 'override_invalid'],
-            },
+            }, 'Closed configuration reason for the unavailable target; paths and raw environment values are omitted.'),
         },
         ['state', 'reason']
-    )
+    ), 'A configured target could not be resolved; this does not prove the plugin is absent or disabled.')
 );
 
 const storageStatusSchema = object(
     {
-        results: storageTargetStatusSchema,
-        marketplaceArtifacts: storageTargetStatusSchema,
-        feedbackArtifacts: storageTargetStatusSchema,
+        results: described(storageTargetStatusSchema, 'Resolved storage configuration for ordinary tool results.'),
+        marketplaceArtifacts: described(storageTargetStatusSchema, 'Resolved storage configuration for marketplace report artifacts.'),
+        feedbackArtifacts: described(storageTargetStatusSchema, 'Resolved storage configuration for explicit-consent feedback artifacts.'),
     },
     ['results', 'marketplaceArtifacts', 'feedbackArtifacts']
 );
 
-const bridgeStatusSchema = object({
-    ok: { const: true },
-    extensionConnected: boolean,
-    browserJobSupported: boolean,
-    bridgeRole: { type: 'string', enum: ['primary', 'secondary', 'disconnected'] },
-    bridgeTransitioning: boolean,
-    listenerState: { type: 'string', enum: ['pending', 'listening', 'address_in_use', 'failed'] },
-    state: { type: 'string', enum: ['initializing', 'listen_failed', 'waiting_for_extension', 'extension_connected_no_wb_tab', 'extension_contended', 'extension_context_unknown', 'peer_context_unknown', 'ready', 'extension_update_required', 'peer_reconnecting', 'peer_unavailable'] },
-    extension: object({
-        state: { type: 'string', enum: ['never_connected', 'connected', 'disconnected'] },
-        route: { type: 'string', enum: ['direct', 'peer', 'none'] },
-        lastConnectedAt: string,
-        lastDisconnectedAt: string,
-        version: string,
-        ozonSellerPromotionReportSupported: boolean,
-        ozonSellerPromotionReportsSupported: boolean,
-        ozonSellerAnalyticsReportSupported: boolean,
-    }, ['state', 'route']),
-    peer: object({ bridgeVersion: string, browserContextPropagationSupported: boolean }),
-    browserContext: object({
-        state: { type: 'string', enum: ['unknown', 'known'] },
-        wbTabConnected: boolean,
-        sellerTabConnected: boolean,
-        changedAt: string,
-    }, ['state']),
-    extensionLastConnectedAtMs: { type: ['number', 'null'] },
-    extensionLastDisconnectedAtMs: { type: ['number', 'null'] },
-    extensionTakeovers: object({
-        count: { type: 'integer' },
-        lastAtMs: { type: ['number', 'null'] },
-        saturated: boolean,
-    }, ['count', 'lastAtMs', 'saturated']),
-    extensionVersion: string,
-    ozonSellerPromotionReportSupported: boolean,
-    ozonSellerPromotionReportsSupported: boolean,
-    ozonSellerAnalyticsReportSupported: boolean,
-    peerRejection: peerRejectionSchema,
-    bridgeVersion: string,
-    bridgeGeneration: positiveInteger,
-    controlProtocolVersion: positiveInteger,
-    extensionProtocolVersion: positiveInteger,
-    instanceId: string,
-    websocket: string,
-    storage: storageStatusSchema,
-}, ['ok', 'extensionConnected', 'bridgeRole', 'storage']);
+const diagnosticBase = (check, facts, causes = ['unknown']) => object({
+    check: described({ const: check }, 'Stable identifier for the observation represented by this check.'), state: described({ type: 'string', enum: DIAGNOSTIC_STATES }, 'Result of this bounded observation; unknown and unsupported remain distinct from failure.'), observedAt: described(string, 'ISO timestamp at which this check made its observation.'),
+    source: described(string, 'Component that produced this fact, without implying evidence from another execution plane.'), executionPlane: described(string, 'Execution plane on which the check actually ran.'), ...(facts ? { facts: described(facts, 'Typed facts observed by this check; omitted when the source supplied no safe facts.') } : {}),
+    cause: described({ type: 'string', enum: causes }, 'Safe closed cause classification; omitted when the state needs no cause or none was observed.'), evidenceRefs: described(array(described(string, 'One safe reference to separately retained evidence, not an embedded path or raw error.')), 'Safe references to separately retained evidence; omitted when no such evidence exists.'), nextCheck: described(string, 'Smallest named observation that can discriminate the remaining uncertainty; omitted when none is needed.'),
+}, ['check', 'state', 'observedAt', 'source', 'executionPlane']);
+
+const bridgeDiagnosticsSchema = object({
+    snapshot: described(diagnosticBase('snapshot'), 'Timestamped production of the status snapshot; it is not a product-health verdict.'),
+    runtime: described(diagnosticBase('runtime', object({ nodeVersion: described(string, 'Version of the Node.js process executing this MCP server.'), platform: described(string, 'Node.js platform identifier for the process executing this MCP server.'), arch: described(string, 'Node.js architecture identifier for the process executing this MCP server.'), bridgeVersion: described(string, 'Version of the local bridge build executing this check.'), mcpProtocolVersion: described(string, 'MCP protocol version negotiated with the current client; omitted when unavailable.') }, ['nodeVersion', 'platform', 'arch', 'bridgeVersion'])), 'Facts about the Node.js process running this MCP server.'),
+    client: described(diagnosticBase('client', object({ name: described(string, 'Bounded client name supplied in MCP initialize metadata.'), version: described(string, 'Bounded client version supplied in MCP initialize metadata.'), provenance: described({ const: 'client_reported' }, 'Marks these values as client-reported rather than trusted host identity.') }, ['name', 'version', 'provenance'])), 'Sanitized MCP initialize metadata; it does not prove host identity or hook support.'),
+    listener: described(diagnosticBase('listener', object({ operation: described({ const: 'bind_listener' }, 'Names the already-observed listener bind operation; status does not retry it.'), listenerState: described({ type: 'string', enum: ['pending', 'listening', 'address_in_use', 'failed'] }, 'Last listener bind event observed by the bridge, not current port ownership.'), systemCode: described({ type: 'string', enum: ['EACCES', 'EPERM', 'EADDRINUSE', 'EADDRNOTAVAIL', 'EAFNOSUPPORT', 'EINVAL'] }, 'Allowlisted operating-system code from the bind observation; omitted when unavailable.') }, ['operation', 'listenerState']), ['address_in_use', 'listen_failed', 'unknown']), 'Existing listener-bind observation; a healthy secondary can report address_in_use as passed.'),
+    pairingSource: described(diagnosticBase('pairing_source', undefined, ['permission_denied', 'insecure_permissions', 'missing', 'corrupt', 'unsupported', 'io_error']), 'Safe pairing-source classification with no token, path, owner, or raw exception.'),
+    routeFreshness: described(diagnosticBase('route_freshness', object({ lastObservedAt: described(string, 'Timestamp of an actually observed route response; omitted when no producer supplies one.') }, ['lastObservedAt'])), 'Freshness of a real extension-route observation, never inferred from browser-context changes.'),
+    storage: described(diagnosticBase('storage', object({ scope: described({ const: 'configuration' }, 'Declares that these storage facts cover configuration resolution only.'), targets: described(storageStatusSchema, 'Sanitized configured storage targets without paths or write claims.') }, ['scope', 'targets'])), 'Read-only storage configuration observation; it does not test writability.'),
+}, ['snapshot', 'runtime', 'client', 'listener', 'pairingSource', 'routeFreshness', 'storage']);
+
+const bridgeStatusSchema = described(object({
+    ok: described({ const: true }, 'Confirms that the status response was constructed; it is not a product-health result.'),
+    extensionConnected: described(boolean, 'Whether an effective direct or authenticated-peer extension route is currently observed.'),
+    browserJobSupported: described(boolean, 'Whether the effective route advertised browser-job support; it does not prove a particular operation will succeed.'),
+    bridgeRole: described({ type: 'string', enum: ['primary', 'secondary', 'disconnected'] }, 'Current local bridge role; secondary is a normal healthy role when another primary owns the listener.'),
+    bridgeTransitioning: described(boolean, 'Whether the bridge is currently changing role; it does not authorize waiting or retrying a business operation.'),
+    listenerState: described({ type: 'string', enum: ['pending', 'listening', 'address_in_use', 'failed'] }, 'Last listener bind event, which does not independently identify current port ownership.'),
+    state: described({ type: 'string', enum: ['initializing', 'listen_failed', 'waiting_for_extension', 'extension_connected_no_wb_tab', 'extension_contended', 'extension_context_unknown', 'peer_context_unknown', 'ready', 'extension_update_required', 'peer_reconnecting', 'peer_unavailable'] }, 'Ordered compatibility summary of observed bridge state, not a complete fault list or retry instruction.'),
+    extension: described(object({
+        state: described({ type: 'string', enum: ['never_connected', 'connected', 'disconnected'] }, 'Effective extension connection observation, including retained disconnected state.'),
+        route: described({ type: 'string', enum: ['direct', 'peer', 'none'] }, 'Route supplying the effective extension observation.'),
+        lastConnectedAt: described(string, 'ISO timestamp of the last observed effective extension connection; omitted if never observed.'),
+        lastDisconnectedAt: described(string, 'ISO timestamp of the last observed effective extension disconnection; omitted if never observed.'),
+        version: described(string, 'Version last reported by the effective extension route; retained after disconnect and omitted if unobserved.'),
+        ozonSellerPromotionReportSupported: described(boolean, 'Capability reported for a single Ozon promotion report; omission means unobserved.'),
+        ozonSellerPromotionReportsSupported: described(boolean, 'Capability reported for packaged Ozon promotion reports; omission means unobserved.'),
+        ozonSellerAnalyticsReportSupported: described(boolean, 'Capability reported for an Ozon analytics report; omission means unobserved.'),
+    }, ['state', 'route']), 'Effective browser-extension observation from a direct or authenticated-peer route.'),
+    peer: described(object({
+        bridgeVersion: described(string, 'Bridge version reported by the authenticated primary peer.'),
+        browserContextPropagationSupported: described(boolean, 'Whether the authenticated primary advertises browser-context propagation.'),
+        diagnosticForwardingSupported: described(boolean, 'Whether the authenticated primary advertised diagnostic_snapshot_forwarding_v1. False includes legacy or other primaries that did not advertise it. This field alone says nothing about extension capability or whether a diagnostic snapshot request will succeed.'),
+    }), 'Authenticated primary-peer metadata; normally omitted on a primary.'),
+    browserContext: described(object({
+        state: described({ type: 'string', enum: ['unknown', 'known'] }, 'Whether registered WB browser-port facts were observed.'),
+        wbTabConnected: described(boolean, 'Whether the extension reports a registered standalone WB page port; this does not prove login.'),
+        sellerTabConnected: described(boolean, 'Whether the extension reports a registered WB Seller page port; this does not describe Ozon.'),
+        changedAt: described(string, 'ISO timestamp when the registered-port observation changed; it is not a freshness guarantee.'),
+    }, ['state']), 'Extension-reported WB and WB Seller port registration; it does not cover Ozon readiness.'),
+    extensionLastConnectedAtMs: described({ oneOf: [described(number, 'Observed effective extension connection time as Unix epoch milliseconds.'), described({ type: 'null' }, 'No effective extension connection has ever been observed.')] }, 'Legacy millisecond copy of the effective extension connection time; null means never observed.'),
+    extensionLastDisconnectedAtMs: described({ oneOf: [described(number, 'Observed effective extension disconnection time as Unix epoch milliseconds.'), described({ type: 'null' }, 'No effective extension disconnection has ever been observed.')] }, 'Legacy millisecond copy of the effective extension disconnection time; null means never observed.'),
+    extensionTakeovers: described(object({
+        count: described({ type: 'integer' }, 'Number of takeovers retained within the bounded recent observation window.'),
+        lastAtMs: described({ oneOf: [described(number, 'Last observed takeover time as Unix epoch milliseconds.'), described({ type: 'null' }, 'No extension takeover has ever been observed.')] }, 'Last observed takeover time in milliseconds; it can fall outside the count window.'),
+        saturated: described(boolean, 'Whether the bounded counter is a lower bound because more takeovers occurred than retained.'),
+    }, ['count', 'lastAtMs', 'saturated']), 'Bounded recent observations of extension socket takeovers without browser-profile identity.'),
+    extensionVersion: described(string, 'Legacy copy of the effective extension version; it is not independent evidence.'),
+    ozonSellerPromotionReportSupported: described(boolean, 'Legacy copy of the single-promotion-report capability; omission means unobserved.'),
+    ozonSellerPromotionReportsSupported: described(boolean, 'Legacy copy of the packaged-promotion-reports capability; omission means unobserved.'),
+    ozonSellerAnalyticsReportSupported: described(boolean, 'Legacy copy of the analytics-report capability; omission means unobserved.'),
+    peerRejection: described(peerRejectionSchema, 'Current continuous peer-rejection streak; omitted when none is active.'),
+    bridgeVersion: described(string, 'Version of the local bridge build producing this status.'),
+    bridgeGeneration: described(positiveInteger, 'Compatibility generation used for coordinated bridge replacement.'),
+    controlProtocolVersion: described(positiveInteger, 'Local authenticated peer-control protocol version.'),
+    extensionProtocolVersion: described(positiveInteger, 'Extension protocol version supported by this bridge build.'),
+    instanceId: described(string, 'Ephemeral identifier of this local bridge process; it is not a host or user identity.'),
+    websocket: described(string, 'Configured loopback WebSocket endpoint; it does not prove ownership or reachability.'),
+    storage: described(storageStatusSchema, 'Read-only resolution status for the three configured storage targets.'),
+    diagnostics: described(bridgeDiagnosticsSchema, 'Typed passive observations collected with this status response.'),
+}, ['ok', 'extensionConnected', 'bridgeRole', 'storage']), 'Passive local bridge status response; successful construction is distinct from product health.');
+
+const operationDiagnosticSchema = described(object({
+    schemaVersion: described({ const: 1 }, 'Version of the operation-diagnostic receipt contract.'), handle: described(string, 'Opaque handle for the latest real completion in this MCP process.'), stage: described(string, 'Last operation stage established by the producer.'), outcome: described({ type: 'string', enum: ['succeeded', 'partial', 'failed', 'uncertain'] }, 'Observed terminal outcome without converting uncertainty into failure.'),
+    retryDisposition: described({ type: 'string', enum: ['allowed', 'forbidden', 'requires_new_authorization', 'unknown'] }, 'Whether repeating the original operation is safe under its existing authorization contract.'),
+}, ['schemaVersion', 'handle', 'stage', 'outcome', 'retryDisposition']), 'Terminal receipt for one exact real operation completion in this MCP process.');
+const diagnosisCheckSchema = described(object({
+    check: described(string, 'Stable identifier for this bounded diagnostic observation.'), state: described({ type: 'string', enum: DIAGNOSTIC_STATES }, 'Observation result, preserving unknown, unsupported, and not_checked separately.'), observedAt: described(string, 'ISO timestamp at which this check made its observation.'), source: described(string, 'Component that produced the check without implying another execution plane.'), executionPlane: described(string, 'Execution plane on which this check actually ran.'),
+    facts: described({ type: 'object', additionalProperties: true }, 'Check-specific sanitized facts defined in DIAGNOSTICS.md; omitted when unavailable.'), cause: described(string, 'Safe cause classification defined for this check; omitted when none was observed.'), evidenceRefs: described(array(described(string, 'One safe reference to separately retained evidence, not an embedded path or raw error.')), 'Safe references to separately retained evidence; omitted when none exist.'), nextCheck: described(string, 'Smallest named observation that can discriminate remaining uncertainty.'),
+}, ['check', 'state', 'observedAt', 'source', 'executionPlane']), 'One bounded diagnostic observation with explicit provenance and omission semantics.');
+const diagnosisSchema = described(object({
+    schemaVersion: described({ const: 1 }, 'Version of the scoped diagnosis response contract.'), scope: described({ type: 'string', enum: ['installation', 'runtime', 'last_operation'] }, 'Diagnostic scope actually evaluated by this response.'),
+    mode: described({ type: 'string', enum: ['passive', 'safe_probes'] }, 'Requested observation mode; safe_probes runs only explicitly allowlisted probes.'), checks: described(array(described(diagnosisCheckSchema, 'One bounded DiagnosticCheck in response order.')), 'Ordered bounded checks produced for the selected scope and mode.'), operation: described(operationDiagnosticSchema, 'Receipt for the exact requested operation handle; omitted outside a matched last_operation diagnosis.'),
+}, ['schemaVersion', 'scope', 'mode', 'checks']), 'Scoped technical diagnosis response that preserves uncertainty and never repeats business work.');
+
+const withOperationDiagnostic = (schema) => schema.oneOf
+    ? { ...schema, oneOf: schema.oneOf.map(withOperationDiagnostic) }
+    : { ...schema, properties: { ...schema.properties, operationDiagnostic: operationDiagnosticSchema } };
 
 const triggerUrlProperty = {
     type: 'string',
@@ -544,6 +592,7 @@ const ozonPromotionErrorSchema = objectUnion(
                 stage: { const: stage },
                 retryable: { const: false },
                 ...(code === 'OZON_ROUTE_NOT_READY' ? { details: ozonExtensionOutdatedDetailsSchema } : {}),
+                ...(code === 'OZON_AUTHORIZATION_REJECTED' ? { details: browserJobRejectionDetailsSchema } : {}),
             },
             ['code', 'message', 'stage', 'retryable']
         )
@@ -623,6 +672,7 @@ const ozonPackageError = (codeStages, analytics = false) =>
                         marketplaceErrorCode: { type: 'integer', minimum: -2147483648, maximum: 2147483647 },
                     }, ['marketplaceErrorCode']) } : {}),
                     ...(code === 'OZON_EXECUTION_INTERRUPTED' ? { details: ozonExecutionInterruptionDetailsSchema } : {}),
+                    ...(code === 'OZON_AUTHORIZATION_REJECTED' ? { details: browserJobRejectionDetailsSchema } : {}),
                 },
                 ['code', 'message', 'stage', 'retryable']
             )
@@ -741,7 +791,7 @@ const liveInputSchema = (limitName, scope) =>
         ...(limitName ? projectionProperties(limitName, scope) : {}),
     });
 
-const feedbackArtifactId = { type: 'string', pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' };
+export const feedbackArtifactIdSchema = { type: 'string', pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' };
 const feedbackSha256 = { type: 'string', pattern: '^[a-f0-9]{64}$' };
 const feedbackClaim = { type: 'string', pattern: '^[A-Za-z0-9_-]{43}$' };
 const feedbackSession = { type: 'string', pattern: '^[a-f0-9]{64}$' };
@@ -751,7 +801,7 @@ const hookOnlyFeedbackField = (description) => ({
         `${description.description} Injected by the trusted Claude or Codex host hook immediately before this local tool call; ` +
         'model-authored arguments must omit it and every snake_case alias.',
 });
-// Preserve authored report text: the STDIO message and trusted prepare binding enforce
+// Preserve authored report text: the STDIO message limit and trusted prepare hook enforce
 // MAX_MCP_MESSAGE_BYTES before rendering. The archive budget also includes the transcript;
 // it is not a replacement per-field allowance for model-authored summary/details.
 const feedbackPrepareSchema = object(
@@ -769,7 +819,7 @@ const feedbackPrepareSchema = object(
 );
 const feedbackSubmitSchema = object(
     {
-        artifactId: feedbackArtifactId,
+        artifactId: feedbackArtifactIdSchema,
         uploadUrl: hookOnlyFeedbackField({ type: 'string', minLength: 1, maxLength: 8192, description: 'Signed HTTPS upload URL.' }),
         requiredHeaders: hookOnlyFeedbackField({ type: 'object', properties: {}, additionalProperties: { type: 'string', maxLength: 8192 }, description: 'Signed required request headers.' }),
         objectKey: hookOnlyFeedbackField({ type: 'string', minLength: 1, maxLength: 1024, description: 'Storage object key.' }),
@@ -778,10 +828,14 @@ const feedbackSubmitSchema = object(
         expectedSha256: hookOnlyFeedbackField({ ...feedbackSha256, description: 'Expected archive SHA-256.' }),
         feedbackClaim: hookOnlyFeedbackField({ ...feedbackClaim, description: 'Local feedback handoff signature injected by the trusted host hook.' }),
         feedbackSession: hookOnlyFeedbackField({ ...feedbackSession, description: 'Bound host-session digest for the feedback claim.' }),
-        feedbackAdapter: hookOnlyFeedbackField({ ...feedbackHostAdapterMarkerSchema, description: 'Host feedback result adapter marker.' }),
+        feedbackCloud: hookOnlyFeedbackField({ ...feedbackCloudTransportSchema, description: 'Cloud transport injected by the trusted cloud hook: grant-bound archive bytes for device-side upload.' }),
     },
     ['artifactId']
 );
+// Every feedback error message is bounded the same way. Hook-authored messages import this bound instead
+// of restating it, so a published result can never fall out of the schema it is validated against.
+export const FEEDBACK_MESSAGE_MAX_LENGTH = 500;
+const feedbackMessage = { type: 'string', minLength: 1, maxLength: FEEDBACK_MESSAGE_MAX_LENGTH };
 export const feedbackDiagnosticsSchema = object({
     operation: { type: 'string', enum: FEEDBACK_DIAGNOSTIC_OPERATIONS },
     errorType: { type: 'string', enum: FEEDBACK_DIAGNOSTIC_ERROR_TYPES },
@@ -792,24 +846,26 @@ export const feedbackDiagnosticsSchema = object({
 }, ['operation']);
 const feedbackErrorObject = (properties, required) => object({ ...properties, details: feedbackDiagnosticsSchema }, required);
 const feedbackErrorSchema = objectUnion(
-    feedbackErrorObject({ code: { const: 'FEEDBACK_SUBMISSION_FAILED' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'submit' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-    feedbackErrorObject({ code: { const: 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'handoff' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-    feedbackErrorObject({ code: { const: 'ARTIFACT_UNAVAILABLE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'artifact' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-    feedbackErrorObject({ code: { const: 'UPLOAD_GRANT_INVALID' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'grant' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-    feedbackErrorObject({ code: { const: 'UPLOAD_REJECTED' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-    feedbackErrorObject({ code: { const: 'UPLOAD_UNCERTAIN' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable'])
+    feedbackErrorObject({ code: { const: 'FEEDBACK_SUBMISSION_FAILED' }, message: feedbackMessage, stage: { const: 'submit' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE' }, message: feedbackMessage, stage: { const: 'handoff' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'ARTIFACT_UNAVAILABLE' }, message: feedbackMessage, stage: { const: 'artifact' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'UPLOAD_GRANT_INVALID' }, message: feedbackMessage, stage: { const: 'grant' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'UPLOAD_REJECTED' }, message: feedbackMessage, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'UPLOAD_UNCERTAIN' }, message: feedbackMessage, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'UPLOAD_DESTINATION_REFUSED' }, message: feedbackMessage, stage: { const: 'grant' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_ARCHIVE_MISMATCH' }, message: feedbackMessage, stage: { const: 'artifact' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable'])
 );
 const feedbackPreparationErrorSchema = objectUnion(
-    feedbackErrorObject({ code: { const: 'FEEDBACK_INPUT_INVALID' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'prepare' }, retryable: { const: false }, recommendedAction: { const: 'RETRY_WITH_VALID_REPORT' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
-    feedbackErrorObject({ code: { const: 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'handoff' }, retryable: { const: false }, recommendedAction: { const: 'CHECK_FEEDBACK_HOOKS' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
-    feedbackErrorObject({ code: { const: 'FEEDBACK_CLAIM_INVALID' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'handoff' }, retryable: { const: false }, recommendedAction: { const: 'RESTART_FEEDBACK_FLOW' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
-    feedbackErrorObject({ code: { const: 'TRANSCRIPT_UNAVAILABLE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'transcript' }, retryable: { const: true }, recommendedAction: { const: 'RETRY_FEEDBACK_ONCE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
-    feedbackErrorObject({ code: { const: 'FEEDBACK_ARCHIVE_FAILED' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'archive' }, retryable: { const: true }, recommendedAction: { const: 'RETRY_FEEDBACK_ONCE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
-    feedbackErrorObject({ code: { const: 'FEEDBACK_STORAGE_UNAVAILABLE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'storage' }, retryable: { const: true }, recommendedAction: { const: 'CHECK_LOCAL_STORAGE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
-    feedbackErrorObject({ code: { const: 'FEEDBACK_PREPARATION_FAILED' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'prepare' }, retryable: { const: true }, recommendedAction: { const: 'RETRY_FEEDBACK_ONCE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction'])
+    feedbackErrorObject({ code: { const: 'FEEDBACK_INPUT_INVALID' }, message: feedbackMessage, stage: { const: 'prepare' }, retryable: { const: false }, recommendedAction: { const: 'RETRY_WITH_VALID_REPORT' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE' }, message: feedbackMessage, stage: { const: 'handoff' }, retryable: { const: false }, recommendedAction: { const: 'CHECK_FEEDBACK_HOOKS' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_CLAIM_INVALID' }, message: feedbackMessage, stage: { const: 'handoff' }, retryable: { const: false }, recommendedAction: { const: 'RESTART_FEEDBACK_FLOW' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
+    feedbackErrorObject({ code: { const: 'TRANSCRIPT_UNAVAILABLE' }, message: feedbackMessage, stage: { const: 'transcript' }, retryable: { const: true }, recommendedAction: { const: 'RETRY_FEEDBACK_ONCE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_ARCHIVE_FAILED' }, message: feedbackMessage, stage: { const: 'archive' }, retryable: { const: true }, recommendedAction: { const: 'RETRY_FEEDBACK_ONCE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_STORAGE_UNAVAILABLE' }, message: feedbackMessage, stage: { const: 'storage' }, retryable: { const: true }, recommendedAction: { const: 'CHECK_LOCAL_STORAGE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_PREPARATION_FAILED' }, message: feedbackMessage, stage: { const: 'prepare' }, retryable: { const: true }, recommendedAction: { const: 'RETRY_FEEDBACK_ONCE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction'])
 );
 const feedbackPrepareSuccessSchema = object(
-    { ok: { const: true }, status: { const: 'prepared' }, artifactId: feedbackArtifactId, kind: { type: 'string', enum: FEEDBACK_KINDS }, sizeBytes: positiveInteger, sha256: feedbackSha256, transcriptIncluded: boolean, summary: { type: 'string', minLength: 1, maxLength: 512 } },
+    { ok: { const: true }, status: { const: 'prepared' }, artifactId: feedbackArtifactIdSchema, kind: { type: 'string', enum: FEEDBACK_KINDS }, sizeBytes: positiveInteger, sha256: feedbackSha256, transcriptIncluded: boolean, summary: { type: 'string', minLength: 1, maxLength: 512 } },
     ['ok', 'status', 'artifactId', 'kind', 'sizeBytes', 'sha256', 'transcriptIncluded', 'summary']
 );
 const feedbackPrepareFailureSchema = object(
@@ -817,39 +873,49 @@ const feedbackPrepareFailureSchema = object(
     ['ok', 'status', 'error']
 );
 const feedbackSubmitSuccessSchema = object(
-    { ok: { const: true }, status: { const: 'uploaded' }, artifactId: feedbackArtifactId, transcriptIncluded: boolean },
+    { ok: { const: true }, status: { const: 'uploaded' }, artifactId: feedbackArtifactIdSchema, transcriptIncluded: boolean },
     ['ok', 'status', 'artifactId', 'transcriptIncluded']
 );
 const feedbackSubmitFailureSchema = object(
-    { ok: { const: false }, status: { type: 'string', enum: ['failed', 'rejected', 'uncertain'] }, artifactId: feedbackArtifactId, error: feedbackErrorSchema },
+    { ok: { const: false }, status: { type: 'string', enum: ['failed', 'rejected', 'uncertain'] }, artifactId: feedbackArtifactIdSchema, error: feedbackErrorSchema },
     ['ok', 'status', 'error']
 );
 const feedbackCloudNotStartedSchema = object({
-    ok: { const: false }, status: { const: 'not_started' }, artifactId: feedbackArtifactId,
+    ok: { const: false }, status: { const: 'not_started' }, artifactId: feedbackArtifactIdSchema,
+    // insufficient_execution_budget is no longer produced: no hook uploads, so neither runs a budget
+    // check. It stays accepted so attempt and operation records the previous build wrote remain
+    // readable for the rest of their 24-hour retention.
     reason: { type: 'string', enum: ['insufficient_execution_budget', 'FEEDBACK_GRANT_REFRESH_REQUIRED'] },
     error: feedbackErrorObject({ code: { type: 'string', enum: ['insufficient_execution_budget', 'FEEDBACK_GRANT_REFRESH_REQUIRED', 'FEEDBACK_GRANT_MISSING', 'FEEDBACK_SUBMISSION_FAILED'] },
-        message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'handoff' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+        message: feedbackMessage, stage: { const: 'handoff' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
 }, ['ok', 'status', 'artifactId', 'error']);
-const feedbackHostUnavailableSchema = (targetTool) => object(
+const feedbackPrepareHostUnavailableSchema = object(
     {
         ok: { const: false },
         status: { const: 'host_result_unavailable' },
         adapter: object({
             ...feedbackHostAdapterMarkerSchema.properties,
-            targetTool: { const: targetTool },
+            targetTool: { const: 'prepare_e_comet_feedback' },
         }, ['version', 'operationId', 'nonce', 'targetTool']),
+        bridgeStatus: feedbackDeviceSnapshotSchema,
         error: object({
             code: { const: 'FEEDBACK_HOST_RESULT_UNAVAILABLE' },
-            message: { type: 'string', minLength: 1, maxLength: 500 },
+            message: feedbackMessage,
             stage: { const: 'handoff' },
             retryable: { const: false },
         }, ['code', 'message', 'stage', 'retryable']),
     },
-    ['ok', 'status', 'adapter', 'error']
+    ['ok', 'status', 'adapter', 'bridgeStatus', 'error']
 );
 
 export const toolInputSchemas = {
-    local_bridge_status: object({}),
+    local_bridge_status: described(object({}), 'No arguments: this tool passively observes existing local bridge state.'),
+    e_comet_diagnose: described(object({
+        scope: described({ type: 'string', enum: ['installation', 'runtime', 'last_operation'] }, 'Evidence domain to inspect: packaged installation, current bridge runtime, or one exact operation receipt.'),
+        mode: described({ type: 'string', enum: ['passive', 'safe_probes'] }, 'Passive reads existing facts; safe_probes additionally runs only the explicitly selected allowlisted probes.'),
+        operationHandle: described(string, 'Opaque handle returned by the exact terminal operation; required only for last_operation and never substitutes the latest result.'),
+        probes: described(array(described({ type: 'string', enum: ['storage_write', 'extension_snapshot'] }, 'storage_write applies only to installation; extension_snapshot applies only to runtime.'), { uniqueItems: true }), 'Allowlisted probes requested for safe_probes mode; an inapplicable requested probe is not executed and is omitted from checks.'),
+    }, ['scope', 'mode']), 'Selects one diagnostic scope and observation mode without authorizing a business operation.'),
     wb_product_card: liveInputSchema(),
     wb_search_by_query: liveInputSchema('productLimitPerQuery', 'query'),
     wb_check_by_query: liveInputSchema(),
@@ -917,25 +983,40 @@ export const toolInputSchemas = {
 
 export const toolOutputSchemas = {
     local_bridge_status: bridgeStatusSchema,
-    wb_product_card: objectUnion(...liveAggregateSchemas(productCardSuccessSchema), toolErrorSchema),
-    wb_search_by_query: objectUnion(...liveAggregateSchemas(searchSuccessSchema), toolErrorSchema),
-    wb_check_by_query: objectUnion(...liveAggregateSchemas(checkSuccessSchema), toolErrorSchema),
-    wb_recommendations_by_product: objectUnion(...liveAggregateSchemas(recommendationsSuccessSchema), toolErrorSchema),
-    wb_seller_reviews: objectUnion(sellerReviewsSuccessSchema, toolErrorSchema),
-    prepare_e_comet_feedback: objectUnion(feedbackPrepareSuccessSchema, feedbackPrepareFailureSchema, feedbackHostUnavailableSchema('prepare_e_comet_feedback')),
-    submit_e_comet_feedback: objectUnion(feedbackSubmitSuccessSchema, feedbackSubmitFailureSchema, feedbackCloudNotStartedSchema, feedbackHostUnavailableSchema('submit_e_comet_feedback')),
-    wb_product_images: objectUnion(...liveAggregateSchemas(imagesSuccessSchema), toolErrorSchema),
-    ozon_seller_promotion_report: objectUnion(ozonPromotionSuccessSchema, ozonPromotionFailureSchema, ozonPromotionPreflightFailureSchema),
-    ozon_seller_promotion_reports: packageResultSchema(
+    e_comet_diagnose: diagnosisSchema,
+    wb_product_card: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(productCardSuccessSchema), toolErrorSchema)),
+    wb_search_by_query: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(searchSuccessSchema), toolErrorSchema)),
+    wb_check_by_query: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(checkSuccessSchema), toolErrorSchema)),
+    wb_recommendations_by_product: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(recommendationsSuccessSchema), toolErrorSchema)),
+    wb_seller_reviews: withOperationDiagnostic(objectUnion(sellerReviewsSuccessSchema, toolErrorSchema)),
+    prepare_e_comet_feedback: withOperationDiagnostic(objectUnion(feedbackPrepareSuccessSchema, feedbackPrepareFailureSchema, feedbackPrepareHostUnavailableSchema)),
+    submit_e_comet_feedback: withOperationDiagnostic(objectUnion(feedbackSubmitSuccessSchema, feedbackSubmitFailureSchema, feedbackCloudNotStartedSchema)),
+    wb_product_images: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(imagesSuccessSchema), toolErrorSchema)),
+    ozon_seller_promotion_report: withOperationDiagnostic(objectUnion(ozonPromotionSuccessSchema, ozonPromotionFailureSchema, ozonPromotionPreflightFailureSchema)),
+    ozon_seller_promotion_reports: withOperationDiagnostic(packageResultSchema(
         'ozon_seller_promotion_reports',
         'periods',
         promotionPackageItems
-    ),
-    ozon_seller_analytics_report: packageResultSchema(
+    )),
+    ozon_seller_analytics_report: withOperationDiagnostic(packageResultSchema(
         'ozon_seller_analytics_report',
         'reports',
         analyticsPackageItems
-    ),
+    )),
+};
+
+export const schemaContractTerms = (schema = bridgeStatusSchema) => {
+    const terms = new Set();
+    const visit = (node, path) => {
+        if (!node || typeof node !== 'object') return;
+        if (path) terms.add(path);
+        if (Array.isArray(node.enum)) for (const value of node.enum) terms.add(`${path}=${value}`);
+        if (Object.hasOwn(node, 'const') && ['string', 'boolean', 'number'].includes(typeof node.const)) terms.add(`${path}=${node.const}`);
+        for (const alternative of node.oneOf ?? []) visit(alternative, path);
+        for (const [name, child] of Object.entries(node.properties ?? {})) visit(child, path ? `${path}.${name}` : name);
+    };
+    visit(schema, '');
+    return Object.freeze([...terms].sort());
 };
 
 const canonicalUniqueValue = (value, ancestors = new Set()) => {

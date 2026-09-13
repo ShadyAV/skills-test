@@ -95,10 +95,11 @@ export const executeOzonReportPackage = async ({
     family,
     jobType,
     items,
-    artifactJobId,
     packageDeadline,
     requestOzonReportPackage,
     createArtifactWriter,
+    // Production wrappers own the invocation and supply its shared counter. Revisit this contract
+    // for new callers rather than accidentally giving each writer its own invocation budget.
     jobBudget,
     artifactName,
     normalizeError,
@@ -167,7 +168,6 @@ export const executeOzonReportPackage = async ({
                     const stream = {};
                     streams.set(itemIndex, stream);
                     stream.writer = await createArtifactWriter({
-                        jobId: artifactJobId,
                         fileName: artifactName(items[itemIndex], itemIndex),
                         mimeType: XLSX_MIME_TYPE,
                         validateXlsx: true,

@@ -3,6 +3,20 @@ import { ozonExtensionOutdatedError, ToolExecutionError } from './tool-errors.mj
 import { sendWs, WS_OPEN } from './websocket.mjs';
 import { markOzonPackageNotStarted } from './ozon-report-package-result.mjs';
 
+export const createDiagnosticSnapshotRoute = ({ connections, sendExtension = sendWs }) => ({ requestId }) => {
+    if (connections.extensionReady) {
+        if (!connections.extensionDiagnosticSnapshotReady) throw new ToolExecutionError('UNSUPPORTED_CAPABILITY', 'The connected extension does not support diagnostic snapshots.', 'extension', false);
+        sendExtension(connections.extensionSocket, localMessage(requestId, MESSAGE_TYPES.diagnosticSnapshot, { protocolVersion: 1 }));
+        return;
+    }
+    if (connections.peerReady && connections.peerExtensionDiagnosticSnapshotReady &&
+        connections.authenticatedPrimaryMetadata?.diagnosticForwardingSupported === true && connections.peerSocket?.readyState === WS_OPEN) {
+        connections.peerSocket.send(JSON.stringify({ type: 'peer_diagnostic_snapshot', requestId, protocolVersion: 1 }));
+        return;
+    }
+    throw new ToolExecutionError('UNSUPPORTED_CAPABILITY', 'Extension diagnostic snapshots are unavailable on this route.', 'extension', false);
+};
+
 /**
  * @param {{
  *   connections: {

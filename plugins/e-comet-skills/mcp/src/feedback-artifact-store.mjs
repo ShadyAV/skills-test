@@ -13,7 +13,7 @@ const ARTIFACT_ID_PATTERN = new RegExp(`^${UUID}$`);
 // A published artifact directory `report-<uuid>` or an unfinished `report-<uuid>.pending`. The name
 // deliberately differs from the bare `<uuid>` of the previous release: a session started before an
 // update keeps that release's process alive, and its maintenance removes every bare-UUID directory
-// missing from its manifest, whatever its age. Bare-UUID directories it left behind are foreign here.
+// missing from its manifest, whatever its age.
 const OWN_ENTRY_PATTERN = new RegExp(`^report-${UUID}(?:\\.pending)?$`);
 const artifactDirectoryName = (artifactId) => `report-${artifactId}`;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;

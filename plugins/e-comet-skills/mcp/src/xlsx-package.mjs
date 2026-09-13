@@ -26,6 +26,8 @@ for (let index = 0; index < CRC32_TABLE.length; index += 1) {
     for (let bit = 0; bit < 8; bit += 1) value = (value >>> 1) ^ (value & 1 ? 0xedb88320 : 0);
     CRC32_TABLE[index] = value >>> 0;
 }
+// Byte-at-a-time CRC and the pre-bounds zip64 extra read moved verbatim from the previous home; both
+// are slower than necessary with no user-visible difference: accepted residual, see docs/local-agent-architecture.md#accepted-residuals.
 const crc32 = (bytes) => {
     let value = 0xffffffff;
     for (const byte of bytes) value = CRC32_TABLE[(value ^ byte) & 0xff] ^ (value >>> 8);
@@ -383,6 +385,8 @@ const assertRequiredXlsxParts = (contents) => {
         throw new Error('Artifact ZIP does not contain valid XLSX workbook content');
     }
 };
+// Internal required bound: the artifact writer validates it before calling. Omitting it is not a
+// supported path; new callers must supply a validated bound rather than silently disable it.
 export const assertXlsxPackage = (bytes, { maxFileBytes }) => {
     if (!Buffer.isBuffer(bytes) || bytes.length < 22 || bytes.readUInt32LE(0) !== 0x04034b50) {
         throw new Error('Artifact is not a valid XLSX ZIP package');

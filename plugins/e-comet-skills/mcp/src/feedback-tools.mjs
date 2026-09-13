@@ -1,16 +1,19 @@
 import { constants } from 'node:fs';
 import { isUtf8 } from 'node:buffer';
+import { createHash } from 'node:crypto';
 import { lstat, open } from 'node:fs/promises';
 
-import { BRIDGE_VERSION, FEEDBACK_MAX_BYTES, FEEDBACK_MAX_SUMMARY_LENGTH } from './config.mjs';
+import { BRIDGE_VERSION, FEEDBACK_CLOUD_MAX_BYTES, FEEDBACK_CLOUD_UPLOAD_DESTINATIONS, FEEDBACK_MAX_BYTES, FEEDBACK_MAX_SUMMARY_LENGTH } from './config.mjs';
 import { assertHookFields, loadHookSecret, verifyHookSignature } from './hook-signature.mjs';
 import { feedbackArtifactStorageUnavailable, loadVerifiedFeedbackArtifact, registerFeedbackArtifact, retireFeedbackArtifact } from './feedback-artifact-store.mjs';
 import { serializeFeedbackMetadata } from './feedback-metadata.mjs';
-import { redactFeedbackText, renderFeedbackReport } from './feedback-report.mjs';
-import { createFeedbackZip, feedbackZipFramingBytes } from './feedback-zip.mjs';
-import { putFeedbackArchive } from './feedback-upload.mjs';
+import { foldFeedbackLineEndings, redactFeedbackText, renderFeedbackReport } from './feedback-report.mjs';
+import { createFeedbackZip, feedbackZipEntryLayout, feedbackZipEntryNames, feedbackZipFramingBytes } from './feedback-zip.mjs';
+import { assertUploadDestination, putFeedbackArchive } from './feedback-upload.mjs';
 import { FeedbackPreparationError, feedbackSubmissionFailure } from './feedback-errors.mjs';
 import { feedbackDiagnostics, safeFeedbackProperty, withFeedbackOperation } from './feedback-diagnostics.mjs';
+import { diagnosticCheck } from './diagnostic-facts.mjs';
+import { isValidFeedbackCloudSubmitInput } from './feedback-host-adapter.mjs';
 
 const ARTIFACT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -38,7 +41,7 @@ const verifyHookFields = async ({ tool, sessionHash, signature, fields }) => {
     }
 };
 const safeSummary = (summary) => {
-    const text = redactFeedbackText(summary.replace(/\r\n?/g, '\n')).toWellFormed();
+    const text = redactFeedbackText(foldFeedbackLineEndings(summary)).toWellFormed();
     let end = Math.min(text.length, FEEDBACK_MAX_SUMMARY_LENGTH);
     if (end < text.length && /[\ud800-\udbff]/u.test(text[end - 1])) end -= 1;
     return text.slice(0, end);
@@ -175,8 +178,12 @@ export const prepareECometFeedback = async (input = {}, dependencies = {}) => {
     let diagnostics = {};
     try {
         diagnostics = await getBridgeStatus();
-    } catch {
+    } catch (error) {
         // Diagnostics are optional; reporting must remain possible during bridge failures.
+        const code = safeFeedbackProperty(error, 'code');
+        diagnostics = { bridgeStatusCollection: diagnosticCheck({ check: 'bridge_status_collection', state: 'failed',
+            observedAt: new Date(now()).toISOString(), source: 'feedback_preparation', executionPlane: 'device',
+            cause: ['EACCES', 'EPERM'].includes(code) ? 'permission_denied' : 'unknown' }) };
     }
     const atOperation = (operation, action) => {
         try { return action(); } catch (error) { throw withFeedbackOperation(error, operation); }
@@ -294,6 +301,8 @@ const submitFeedback = async (input = {}, dependencies = {}) => {
     ) {
         return submitError(artifactId, 'failed', 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE', 'The trusted e-Comet hook handoff is unavailable.', 'handoff', false, undefined, 'handoff_submit');
     }
+    // Native authority is a signature; cloud uses the pinned destination. Their entry checks remain
+    // separate and both feed shared uploader validation; stricter downstream checks are intentional.
     const hookFields = {
         artifactId: input.artifactId,
         uploadUrl: input.uploadUrl,
@@ -353,5 +362,94 @@ const submitFeedback = async (input = {}, dependencies = {}) => {
 /** @type {typeof submitFeedback} */
 export const submitECometFeedback = async (input = {}, dependencies = {}) => {
     try { return await submitFeedback(input, dependencies); }
+    catch (error) { return feedbackSubmissionFailure(error, safeFeedbackProperty(input, 'artifactId')); }
+};
+
+// 412 is a success only under the grant that gives it that meaning: `If-None-Match: *` makes the PUT a
+// create, so a precondition failure says the archive this call would have written is already stored.
+// Under any other grant 412 is an ordinary storage rejection, exactly as on the native route.
+const CLOUD_ACCEPTED_STATUSES = Object.freeze([200, 201, 204, 412]);
+const grantForbidsOverwrite = (requiredHeaders) =>
+    Object.entries(requiredHeaders).some(([name, value]) => name.toLowerCase() === 'if-none-match' && value === '*');
+const archiveMismatch = () => Object.assign(
+    new Error('The delivered feedback archive does not match the prepared artifact.'),
+    { feedbackReason: 'archive_mismatch' },
+);
+const archiveShapeRefused = (cause = undefined) => Object.assign(
+    new Error('The delivered feedback archive is not a well-formed feedback package.', cause === undefined ? undefined : { cause }),
+    { feedbackReason: 'archive_shape' },
+);
+
+/**
+ * Bounds the delivered bytes to the archive the canonical writer produces: the entry names its central
+ * directory lists, in order, for this transcript choice. Bytes that agree with the grant and are still
+ * not a feedback package carry their own diagnostic reason (`archive_shape`), distinct from bytes that
+ * disagree with the grant's size or digest (`archive_mismatch`); one error code covers both.
+ */
+const assertFeedbackArchiveShape = (bytes, transcriptIncluded) => {
+    let names;
+    try {
+        names = feedbackZipEntryNames(bytes);
+    } catch (error) {
+        throw archiveShapeRefused(error);
+    }
+    const expected = feedbackZipEntryLayout({ includeTranscript: transcriptIncluded });
+    if (names.length !== expected.length || names.some((name, index) => name !== expected[index])) throw archiveShapeRefused();
+};
+
+/**
+ * Cowork cloud route: the trusted cloud hook could not upload from the sandbox, so it delivered the grant and the
+ * archive bytes inside this call. The device holds no hook secret; the destination pin is the boundary.
+ * @param {{ artifactId?: string, uploadUrl?: string, requiredHeaders?: Record<string, string>, objectKey?: string, expiresAt?: number, expectedSize?: number, expectedSha256?: string, feedbackCloud?: { version: number, operationId: string, nonce: string, transcriptIncluded: boolean, archiveBase64: string } }} input
+ * @param {{ upload?: typeof putFeedbackArchive, now?: () => number, destinations?: ReadonlyArray<{ hostname: string, pathPrefix: string }> }} dependencies
+ */
+const submitCloudFeedback = async (input = {}, dependencies = {}) => {
+    const { upload = putFeedbackArchive, now = Date.now, destinations = FEEDBACK_CLOUD_UPLOAD_DESTINATIONS } = dependencies;
+    const artifactId = safeArtifactId(input.artifactId);
+    if (typeof upload !== 'function' || typeof now !== 'function' || !Array.isArray(destinations)) throw new TypeError('Feedback cloud submission dependencies are invalid.');
+    if (!isValidFeedbackCloudSubmitInput(input) || artifactId === undefined) {
+        return submitError(artifactId, 'failed', 'UPLOAD_GRANT_INVALID', 'The feedback upload grant is invalid or has expired.', 'grant', false,
+            Object.assign(new Error('invalid cloud transport'), { feedbackReason: 'invalid_input' }), 'input_validation');
+    }
+    if (
+        typeof input.uploadUrl !== 'string' || !input.requiredHeaders || typeof input.requiredHeaders !== 'object' || Array.isArray(input.requiredHeaders)
+        // objectKey is validated but never sent: the presigned uploadUrl already carries the destination,
+        // and a grant missing the key the staging hook signed is not a grant this route accepts.
+        || typeof input.objectKey !== 'string' || !Number.isSafeInteger(input.expiresAt) || input.expiresAt * 1000 <= now()
+        || !Number.isSafeInteger(input.expectedSize) || input.expectedSize <= 0 || input.expectedSize > FEEDBACK_CLOUD_MAX_BYTES
+        || typeof input.expectedSha256 !== 'string' || !SHA256.test(input.expectedSha256)
+    ) {
+        return uploadFailure(artifactId, 'UPLOAD_GRANT_INVALID');
+    }
+    try {
+        assertUploadDestination(input.uploadUrl, destinations, input.requiredHeaders);
+    } catch (error) {
+        return submitError(artifactId, 'failed', 'UPLOAD_DESTINATION_REFUSED', 'The feedback upload destination is not an e-Comet storage location.', 'grant', false, error, 'grant_validation');
+    }
+    let bytes;
+    try {
+        bytes = Buffer.from(input.feedbackCloud.archiveBase64, 'base64');
+        if (bytes.length !== input.expectedSize || createHash('sha256').update(bytes).digest('hex') !== input.expectedSha256) throw archiveMismatch();
+        // WHY: grant and bytes arrive in the same input, so size and SHA-256 prove transport integrity,
+        // not provenance. Requiring the prepared archive's own entry list bounds what a substituted grant
+        // can deliver to e-Comet's bucket to a well-formed feedback report.
+        assertFeedbackArchiveShape(bytes, input.feedbackCloud.transcriptIncluded === true);
+    } catch (error) {
+        return submitError(artifactId, 'failed', 'FEEDBACK_ARCHIVE_MISMATCH', 'The delivered feedback archive does not match the prepared artifact.', 'artifact', false, error, 'artifact_read');
+    }
+    try {
+        await upload({ uploadUrl: input.uploadUrl, requiredHeaders: input.requiredHeaders, expiresAt: input.expiresAt, bytes }, {
+            ...(grantForbidsOverwrite(input.requiredHeaders) ? { acceptedStatuses: CLOUD_ACCEPTED_STATUSES } : {}),
+            maxBytes: FEEDBACK_CLOUD_MAX_BYTES,
+        });
+    } catch (error) {
+        return uploadFailure(artifactId, safeFeedbackProperty(error, 'code'), error);
+    }
+    return { ok: true, status: 'uploaded', artifactId, transcriptIncluded: input.feedbackCloud.transcriptIncluded };
+};
+
+/** @type {typeof submitCloudFeedback} */
+export const submitECometCloudFeedback = async (input = {}, dependencies = {}) => {
+    try { return await submitCloudFeedback(input, dependencies); }
     catch (error) { return feedbackSubmissionFailure(error, safeFeedbackProperty(input, 'artifactId')); }
 };

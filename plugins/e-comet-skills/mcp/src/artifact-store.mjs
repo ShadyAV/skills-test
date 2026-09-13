@@ -85,7 +85,7 @@ export const pruneArtifacts = async ({
 
 /**
  * @param {{
- *     jobId?: string, fileName?: string, mimeType?: string, artifactDir?: string,
+ *     fileName?: string, mimeType?: string, artifactDir?: string,
  *     storageTarget?: { state: string, path?: string, reason?: string },
  *     maxChunkBytes?: number, maxFileBytes?: number, maxJobBytes?: number, jobBudget?: { bytes: number },
  *     retentionMs?: number, validateXlsx?: boolean, signal?: AbortSignal, now?: number | (() => number),
@@ -93,7 +93,6 @@ export const pruneArtifacts = async ({
  */
 export const createArtifactWriter = async (options = {}) => {
     const {
-        jobId,
         fileName,
         mimeType,
         artifactDir: configuredArtifactDir,
@@ -109,7 +108,6 @@ export const createArtifactWriter = async (options = {}) => {
         now = Date.now,
     } = options;
     const artifactDir = configuredArtifactDir ?? requireStorageTarget(options.storageTarget ?? ARTIFACT_STORAGE, 'marketplaceArtifacts');
-    if (typeof jobId !== 'string' || jobId.length === 0) throw new Error('Artifact job ID is required');
     if (typeof mimeType !== 'string' || mimeType.length === 0) throw new Error('Artifact MIME type is required');
     validateLimits({ maxChunkBytes, maxFileBytes, maxJobBytes, retentionMs });
     validateJobBudget(jobBudget);
@@ -151,7 +149,10 @@ export const createArtifactWriter = async (options = {}) => {
             jobByteCount = 0;
             await rm(partialPath, { force: true });
             await rm(artifactPath, { force: true });
-        })();
+        })().catch(() => {
+            // Memoize the warning with cleanup so later aborts preserve the primary error without log spam.
+            console.error('STORAGE_CLEANUP_PENDING: Unfinished local workbook files could not be removed yet.');
+        });
         return removal;
     };
     // Cleanup of the own unfinished file is best-effort: a leftover `.part` ages out with the next
@@ -159,7 +160,7 @@ export const createArtifactWriter = async (options = {}) => {
     const fail = async (error) => {
         const primary = asError(error);
         aborted = true;
-        await removeOwn().catch(() => undefined);
+        await removeOwn();
         throw primary;
     };
     const assertWritable = () => {
@@ -169,8 +170,7 @@ export const createArtifactWriter = async (options = {}) => {
     const requestAbort = () => {
         if (completed) return writeChain.then(() => undefined);
         aborted = true;
-        const cleanup = () => removeOwn().catch(() => undefined);
-        writeChain = writeChain.then(cleanup, cleanup);
+        writeChain = writeChain.then(removeOwn, removeOwn);
         return writeChain;
     };
     if (signal) {
@@ -187,6 +187,8 @@ export const createArtifactWriter = async (options = {}) => {
                     const bytes = decodeCanonicalBase64(base64Data, maxChunkBytes);
                     if (bytes.length > maxChunkBytes) throw new Error(`Artifact chunk exceeds the ${maxChunkBytes}-byte chunk limit`);
                     if (byteCount + bytes.length > maxFileBytes) throw new Error(`Artifact exceeds the ${maxFileBytes}-byte per-file limit`);
+                    // Cross-writer callbacks sharing this budget are serialized by the package broker
+                    // or WB export loop. Parallelizing them must revisit reservation before append.
                     if (jobBudget.bytes + bytes.length > maxJobBytes) {
                         throw new ArtifactStoreError('JOB_ARTIFACT_QUOTA_EXCEEDED', `Artifact job quota exceeds the ${maxJobBytes}-byte limit`);
                     }
@@ -221,15 +223,20 @@ export const createArtifactWriter = async (options = {}) => {
                     }
                     assertNotAborted();
                     await rename(partialPath, artifactPath);
-                    // Published: from here on the workbook is immutable and no failure below may remove it.
-                    completed = true;
                     assertNotAborted();
                     await ensurePrivateFile(artifactPath);
                     // The logical AppData path can exist only in the producer's MSIX view; external Excel needs
                     // the finalized physical path.
                     const deliveredPath = process.platform === 'win32' ? await realpath(artifactPath) : artifactPath;
                     assertNotAborted();
+                    // Complete only once the caller can actually receive this workbook. A failure between the
+                    // rename and here is not a publication: nobody learns the path, so the file is removed with
+                    // the rest of this writer's own unfinished data and its bytes go back to the job budget.
+                    // From here on the workbook is immutable and no later failure may remove it.
+                    completed = true;
                     // Housekeeping after the response, never part of it: sweep errors stay in stderr.
+                    // Expired files can occupy space before this publication-driven sweep; that capacity
+                    // boundary is accepted in docs/local-agent-architecture.md#accepted-residuals.
                     void sweepArtifacts(artifactDir, { retentionMs, now: nowMs() });
                     return { name, path: deliveredPath, uri: pathToFileURL(deliveredPath).href, mimeType, size: byteCount, sha256 };
                 } catch (error) {

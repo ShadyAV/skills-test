@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -9,9 +9,11 @@ import { MAX_MCP_MESSAGE_BYTES, FEEDBACK_MAX_BYTES as MAX_FEEDBACK_ARCHIVE_BYTES
     FEEDBACK_ARTIFACT_RETENTION_MS as STATE_RETENTION_MS } from '../mcp/src/config.mjs';
 import { sweepExpired } from '../mcp/src/file-retention.mjs';
 import { loadHookSecret, signHookFields } from '../mcp/src/hook-signature.mjs';
-import { redactFeedbackText } from '../mcp/src/feedback-report.mjs';
-import { toolInputSchemas, validateSchemaValue } from '../mcp/src/tool-schemas.mjs';
+import { foldFeedbackLineEndings, redactFeedbackText } from '../mcp/src/feedback-report.mjs';
+import { toolInputSchemas, toolOutputSchemas, validateSchemaValue } from '../mcp/src/tool-schemas.mjs';
 import { FEEDBACK_DIAGNOSTIC_FILESYSTEM_CODES, feedbackDiagnostics, safeFeedbackProperty, withFeedbackOperation } from '../mcp/src/feedback-diagnostics.mjs';
+import { retryTransientFileOperation } from './transient-file-operation.mjs';
+import { withHookDiagnostic } from './hook-diagnostics.mjs';
 
 // PostToolUse can carry one maximum-size MCP request and response. Reserve another 256 KiB for the
 // host's session/tool metadata and platform paths while keeping malformed stdin decisively bounded.
@@ -43,6 +45,7 @@ const GRANT_HANDOFF_RESERVE_MS = 5_000;
 // WHY: the grant must survive ordinary Post->Pre scheduling and the start of the PUT. Its expiry
 // is not coupled to the uploader's longer wall deadline for completing an already-started request.
 const MIN_STAGE_GRANT_REMAINING_MS = GRANT_START_WINDOW_MS + GRANT_HANDOFF_RESERVE_MS;
+// A grant claimed inside its last minute can still expire before a bridged device starts the PUT: accepted residual, see docs/local-agent-architecture.md#accepted-residuals.
 const MIN_CLAIM_GRANT_REMAINING_MS = GRANT_START_WINDOW_MS;
 const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const HEADER_VALUE_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
@@ -51,8 +54,10 @@ const ISO_EXPIRY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\
 const PROTOTYPE_SPECIAL_HEADER_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
 const LOCAL_FEEDBACK_TOOL =
     /^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:prepare_e_comet_feedback|submit_e_comet_feedback)$/;
+const CLOUD_FEEDBACK_TOOL =
+    /^mcp__remote-devices__plugin_e-comet-skills_e-comet-local__(?:prepare_e_comet_feedback|submit_e_comet_feedback)$/;
 const REMOTE_REPORT_ISSUE_TOOL = new RegExp(
-    `^mcp__(?:e[-_]comet|e_comet_stage|https_mcp_stage_int_e_comet_io_mcp|plugin_e-comet-skills_e-comet|remote-devices__plugin_e-comet-skills_e-comet|${COWORK_UUID_NAMESPACE})__report_issue$`
+    `^mcp__(?:e[-_]comet|e_comet_stage|https_mcp_(?:stage_int_)?e[-_]comet_io_mcp|plugin_e-comet-skills_e-comet|remote-devices__plugin_e-comet-skills_e-comet|${COWORK_UUID_NAMESPACE})__report_issue$`
 );
 
 const ownedErrors = new WeakMap();
@@ -135,7 +140,10 @@ const ensurePrivateStoreDirectory = async (dataDirectory) => {
     if (process.platform !== 'win32') await chmod(dataDirectory, 0o700);
 };
 
-const removeFile = (path) => rm(path, { force: true });
+const removeFile = (path) => retryTransientFileOperation(() => rm(path, { force: true }));
+// Removal that has to distinguish "gone" from "removed by me": `force` would report success for a file
+// another claimer already consumed. Same transient-lock patience as removeFile, ENOENT still raised.
+const consumeFile = (path) => retryTransientFileOperation(() => unlink(path));
 
 const isOwnStateName = (name) =>
     STATE_FILE_PATTERN.test(name) || CLAIMED_MARKER_PATTERN.test(name) || TEMPORARY_STATE_PATTERN.test(name);
@@ -160,12 +168,13 @@ const publishState = async (path, value) => {
     await writeFile(temporaryPath, serialized, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
     try {
         if (process.platform !== 'win32') await chmod(temporaryPath, 0o600);
-        await rename(temporaryPath, path);
+        await retryTransientFileOperation(() => rename(temporaryPath, path));
     } finally {
         await removeFile(temporaryPath).catch(() => undefined);
     }
 };
 
+// Reads through a symlink, unlike the cloud store's lstat: accepted residual, see docs/local-agent-architecture.md#accepted-residuals.
 const readBoundedState = async (path) => {
     const metadata = await stat(path);
     if (!metadata.isFile() || metadata.size > MAX_STATE_FILE_BYTES) {
@@ -432,6 +441,10 @@ const PREPARED_RESULT_KEYS = [
 const GRANT_RESULT_KEYS = ['expires_at', 'object_key', 'required_headers', 'upload_url'];
 const exactKeys = (candidate, keys) =>
     Object.keys(candidate).sort().join('\0') === [...keys].sort().join('\0');
+const exactKeysWithOptionalOperationDiagnostic = (candidate, keys) => {
+    const names = Object.keys(candidate).filter((name) => name !== 'operationDiagnostic');
+    return names.sort().join('\0') === [...keys].sort().join('\0');
+};
 
 const parseWholeBoundedJson = (text, invalid) => {
     if (typeof text !== 'string' || byteLength(text) > MAX_TOOL_RESULT_JSON_BYTES) throw invalid();
@@ -466,7 +479,8 @@ const invalidPrepared = () =>
 const validatePreparedResult = (candidate) => {
     if (
         !isRecord(candidate) ||
-        !exactKeys(candidate, PREPARED_RESULT_KEYS) ||
+        !exactKeysWithOptionalOperationDiagnostic(candidate, PREPARED_RESULT_KEYS) ||
+        !validateSchemaValue(candidate, toolOutputSchemas.prepare_e_comet_feedback) ||
         candidate.ok !== true ||
         candidate.status !== 'prepared' ||
         typeof candidate.summary !== 'string' ||
@@ -639,10 +653,13 @@ export const stageUploadGrant = async ({
     await ensurePrivateStoreDirectory(dataDirectory);
     await sweepState(dataDirectory, retentionMs);
     const grantPath = grantPathForSession(dataDirectory, sessionId);
+    // Preserve the waiting authorization. Its presence does not establish expiry or upload outcome;
+    // submit checks those before dispatch. Expired-grant replacement stays an accepted residual:
+    // docs/local-agent-architecture.md#accepted-residuals.
     if (await stat(grantPath).then(() => true, () => false)) {
         throw new FeedbackHandoffError(
             'FEEDBACK_GRANT_CONFLICT',
-            'Another feedback upload grant is already waiting for this session.'
+            'An upload authorization is already staged for the prepared artifact in this session. Submit the same artifactId, preserving the existing history choice: that call checks expiry and any recorded upload outcome before sending. Request another authorization only if that check asks for a refresh.'
         );
     }
     let prepared;
@@ -692,7 +709,11 @@ export const stageUploadGrant = async ({
 
 // A claim marker lives for one hook run. One left behind by a hook killed mid-claim would deny every
 // later submit of the session until the next prepare, so a marker older than any possible run is
-// reclaimed and the election retried once. Age is the file's own clock, like every other sweep.
+// removed and the election retried once. Age is the file's own clock, like every other sweep.
+// Two claimers that both observe one stale marker can each remove what the other just created and both
+// hold the election; nothing here prevents that, because the outcome is one repeated PUT of the same
+// archive to the same object key, which storage answers with 412. See the accepted residuals in
+// docs/local-agent-architecture.md#accepted-residuals.
 const STALE_CLAIM_MARKER_MS = 60_000;
 const createClaimMarker = async (markerPath) => {
     const create = () => writeFile(markerPath, '', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
@@ -709,6 +730,13 @@ const createClaimMarker = async (markerPath) => {
     await create();
 };
 
+/**
+ * Returns the transport of the grant staged for one prepared artifact. The native route consumes it:
+ * nothing else there elects a single uploader, so the claim itself has to be the one-shot election. The
+ * cloud route does not, because its exclusive attempt file already elects one uploader, and a refusal
+ * that sent nothing would otherwise cost one of the few authorizations the service issues per hour;
+ * that route discards the grant once the upload it covered has ended.
+ */
 export const claimUploadGrant = async ({
     dataDirectory,
     sessionId,
@@ -716,6 +744,7 @@ export const claimUploadGrant = async ({
     targetTool,
     nowMs = Date.now(),
     retentionMs = STATE_RETENTION_MS,
+    consume = true,
 }) => {
     validateSessionId(sessionId);
     if (targetTool !== SUBMIT_TARGET_TOOL) {
@@ -748,13 +777,17 @@ export const claimUploadGrant = async ({
     );
     // Exclusive create is the one-shot election: a rename reports success to more than one native
     // Windows caller, and reading only after winning keeps a later winner from seeing consumed bytes.
-    try {
-        await createClaimMarker(markerPath);
-    } catch (error) {
-        // Only an existing marker means a consumed grant; any other failure is a storage error.
-        if (safeFeedbackProperty(error, 'code') !== 'EEXIST') throw error;
-        throw grantMissing(error);
+    if (consume) {
+        try {
+            await createClaimMarker(markerPath);
+        } catch (error) {
+            // Only an existing marker means a consumed grant; any other failure is a storage error.
+            if (safeFeedbackProperty(error, 'code') !== 'EEXIST') throw error;
+            throw grantMissing(error);
+        }
     }
+    // A claim that consumes nothing holds no election to release.
+    const releaseElection = async () => { if (consume) await removeFile(markerPath).catch(() => undefined); };
     let entry;
     try {
         entry = parseGrantEntry(await readBoundedState(grantPath), { nowMs, retentionMs, allowExpired: true });
@@ -762,33 +795,40 @@ export const claimUploadGrant = async ({
         // Nothing was consumed, so the election is released: a marker left here would hide the grant a
         // concurrent report_issue is publishing right now, or one a later read could still serve, until
         // the next prepare. Unreadable state never carries authority and is removed with it.
-        await removeFile(markerPath).catch(() => undefined);
+        await releaseElection();
         if (error instanceof FeedbackHandoffError) await removeFile(grantPath);
         if (!(error instanceof FeedbackHandoffError) && safeFeedbackProperty(error, 'code') !== 'ENOENT') throw error;
         throw grantMissing(error);
     }
     if (entry.artifactId !== artifactId) {
         // Nothing was consumed: release the election so the matching submit can still claim this grant.
-        await removeFile(markerPath);
+        await releaseElection();
         throw new FeedbackHandoffError(
             'FEEDBACK_ARTIFACT_MISMATCH',
             'The feedback upload grant does not match this prepared artifact.'
         );
     }
     if (entry.expiresAt * 1000 - nowMs < MIN_CLAIM_GRANT_REMAINING_MS) {
-        // The doomed authorization is consumed; the prepared artifact stays for one fresh report_issue.
+        // The doomed authorization is removed on both routes; the prepared artifact stays for the one
+        // fresh report_issue this refusal names, which a kept grant would otherwise refuse as a conflict.
         await removeFile(grantPath);
+        await releaseElection();
         throw grantRefreshRequired();
     }
-    // Consume the grant before releasing the election: no second reader may observe it. A grant that
-    // cannot be removed right now was not consumed, so the election is released with the error.
-    try {
-        await removeFile(grantPath);
-    } catch (error) {
-        await removeFile(markerPath).catch(() => undefined);
-        throw error;
+    if (consume) {
+        // Consume the grant before releasing the election: no second reader may observe it. The removal
+        // is strict, because a grant that is already gone was consumed by someone else and this call
+        // holds no authorization. A grant that cannot be removed right now was not consumed either, so
+        // the election is released with the error.
+        try {
+            await consumeFile(grantPath);
+        } catch (error) {
+            await removeFile(markerPath).catch(() => undefined);
+            if (safeFeedbackProperty(error, 'code') === 'ENOENT') throw grantMissing(error);
+            throw error;
+        }
+        await removeFile(markerPath);
     }
-    await removeFile(markerPath);
     return {
         uploadUrl: entry.uploadUrl,
         objectKey: entry.objectKey,
@@ -797,6 +837,19 @@ export const claimUploadGrant = async ({
         expectedSize: entry.sizeBytes,
         expectedSha256: entry.sha256,
     };
+};
+
+/**
+ * Removes the authorization staged for this session once the upload it covered has ended. Only the
+ * route that does not consume on claim needs it, and whatever is staged is that same authorization: a
+ * new preparation clears the session's grant, and only one can be staged at a time.
+ */
+export const discardUploadGrant = async ({ dataDirectory, sessionId }) => {
+    validateSessionId(sessionId);
+    if (typeof dataDirectory !== 'string' || !dataDirectory) {
+        throw new FeedbackHandoffError('FEEDBACK_INVALID_STATE', 'The feedback handoff state is invalid.');
+    }
+    await removeFile(grantPathForSession(dataDirectory, sessionId));
 };
 
 const validateTranscriptPath = (path) => {
@@ -838,6 +891,8 @@ const preToolUseOutput = (updatedInput) =>
 const deniedPreToolUseOutput = (error) => {
     const recovery = error.code === 'FEEDBACK_GRANT_REFRESH_REQUIRED'
         ? 'Call report_issue again for the same prepared artifact.'
+        : error.code === 'FEEDBACK_ARTIFACT_MISMATCH'
+            ? 'Nothing was sent and the existing authorization is kept. Use the artifactId from the prepared result associated with the existing authorization, preserving its consent and history choice. If that association is unclear, inspect the preparation and authorization results first; do not request another authorization or recreate the report to bypass the mismatch.'
         : error.code === 'FEEDBACK_GRANT_MISSING'
             ? 'This submit call was blocked before upload; the hook ran. No upload was attempted by this call. This does not establish the outcome of an earlier submit. Do not retry automatically with unchanged state. Check the observed call sequence: if report_issue has not been called for this prepared artifact and no earlier upload has an uncertain outcome, find remote e-Comet report_issue and call it once with the prepared kind and size_bytes, then submit the same artifactId, preserving the existing consent and history choice. If report_issue is unavailable, stop and report that the remote authorization tool is unavailable; check the remote e-Comet connector status and ask to connect only when it is observed disconnected. If report_issue was already called, inspect its result and handoff evidence instead of repeating it or guessing a cause.'
             : 'Do not retry automatically. Ask the user before starting a new feedback flow.';
@@ -874,9 +929,14 @@ const safeHookError = (error, operation) => {
     return { code: 'FEEDBACK_INTERNAL_ERROR', message: 'The local feedback handoff failed internally.', details: { ...details, reason: 'internal_error' } };
 };
 
-const cloudDenialRecovery = code => {
+const cloudDenialRecovery = (code, target) => {
     if (code === 'FEEDBACK_INVALID_INPUT') {
         return 'Correct the authored arguments using the existing user consent and history choice; this denial did not start an upload.';
+    }
+    // A preparation denial precedes every authorization and upload of this flow, so the submit wording
+    // about unestablished upload state would describe a state this call cannot have produced.
+    if (target === 'prepare_e_comet_feedback') {
+        return 'This preparation did not start and no upload state exists; fix the named prerequisite and prepare again with the same consent and history choice.';
     }
     return 'Existing upload state could not be established; do not obtain another grant or start another feedback flow to bypass this failure. Preserve the same artifact and safe evidence for support.';
 };
@@ -918,7 +978,7 @@ export const prepareInputWithTrustedTranscript = (event) => {
 
 // Hooks receive arguments, not the host's JSON-RPC id/_meta. Leave bounded headroom
 // for supported host envelopes, in addition to measuring the injected fields themselves.
-const FEEDBACK_ENVELOPE_RESERVE_BYTES = 4096;
+export const FEEDBACK_ENVELOPE_RESERVE_BYTES = 4096;
 const REPORT_SHORTENING_MARKER = '\n[... middle omitted to fit the feedback request size limit ...]\n';
 const shortenReportMiddle = (text, retained) => {
     if (retained >= text.length) return text;
@@ -929,16 +989,30 @@ const shortenReportMiddle = (text, retained) => {
     if (tail > 0 && /[\uD800-\uDBFF]/u.test(text[tail - 1]) && /[\uDC00-\uDFFF]/u.test(text[tail] ?? '')) tail += 1;
     return text.slice(0, head) + REPORT_SHORTENING_MARKER + text.slice(tail);
 };
+// The cloud route fits the same report into its smaller archive budget, so the caller may lower the
+// limit; the default stays the host wire envelope every route has to satisfy. That route must also
+// measure what canonical prepare will render: redaction expands credential-like text, so measuring the
+// authored text alone would stage a report no retry of it could ever archive. The stored text is
+// redacted exactly once more downstream, which is what `measureRendered` projects here.
 export const fitPrepareWireInput = (input, transportFields = {
     feedbackClaim: 'a'.repeat(43), feedbackSession: 'a'.repeat(64),
-}) => {
-    const fits = (value) => byteLength(JSON.stringify({
-        ...value, ...transportFields,
-    })) <= MAX_MCP_MESSAGE_BYTES - FEEDBACK_ENVELOPE_RESERVE_BYTES;
+}, { limitBytes = MAX_MCP_MESSAGE_BYTES - FEEDBACK_ENVELOPE_RESERVE_BYTES, measureRendered = false } = {}) => {
+    // Canonical rendering folds line endings before redacting, and the header redactors match to the
+    // end of a line: measuring CR-delimited text unfolded would collapse a whole report into one match.
+    const redacted = (value) => (typeof value === 'string' ? redactFeedbackText(foldFeedbackLineEndings(value)) : value);
+    const measured = (value) => (measureRendered
+        ? { ...value, summary: redacted(value.summary), details: redacted(value.details) } : value);
+    const wireBytes = (value) => byteLength(JSON.stringify({ ...value, ...transportFields }));
+    // The archive projection can shrink credentials or expand redaction markers. Both it and the
+    // actual injected input must fit: measuring only the projection lets oversized raw text escape.
+    const fits = (value) => wireBytes(value) <= limitBytes && wireBytes(measured(value)) <= limitBytes;
     if (fits(input)) return input;
     // Cutting a header/key away from its credential value defeats contextual redaction.
-    // Redact whole source fields before any cut, then bind only the final safe text.
-    let fitted = { ...input, summary: redactFeedbackText(input.summary), details: redactFeedbackText(input.details) };
+    // Redact whole source fields before any cut, then bind only the final safe text. Line endings are
+    // folded first, exactly as the canonical report does: redacting lone-CR text unfolded would treat
+    // the whole report as one header line and swallow its contents into a single redaction.
+    let fitted = { ...input,
+        summary: redactFeedbackText(foldFeedbackLineEndings(input.summary)), details: redactFeedbackText(foldFeedbackLineEndings(input.details)) };
     // Details are the ordinary oversized field. Summary is only a last resort when
     // it alone exhausts the budget; normal inputs and the trusted transcript path stay unchanged.
     for (const field of ['details', 'summary']) {
@@ -973,7 +1047,7 @@ const loadSigningSecret = async (env) => {
     }
 };
 
-export const processHookEvent = async (event, _options = {}) => {
+const processHookEventAuthoritative = async (event, _options = {}) => {
     if (!isRecord(event)) {
         const error = new FeedbackHandoffError('FEEDBACK_INVALID_EVENT', 'The desktop hook event is invalid.');
         return { exitCode: 2, stdout: '', stderr: `${error.code}: ${error.message}` };
@@ -985,17 +1059,18 @@ export const processHookEvent = async (event, _options = {}) => {
     // model-authored adapter fields never select cloud execution.
     // Native matchers tolerate historical spelling aliases; that does not attest an
     // underscore-spelled cloud consumer. Broaden this boundary only with host evidence.
-    if (/^mcp__remote-devices__plugin_e-comet-skills_e-comet-local__(?:prepare_e_comet_feedback|submit_e_comet_feedback)$/.test(toolName)
-        && ['PreToolUse', 'PostToolUse'].includes(eventName)) {
+    if (CLOUD_FEEDBACK_TOOL.test(toolName)
+        && (['PreToolUse', 'PostToolUse'].includes(eventName)
+            || (eventName === 'PostToolUseFailure' && toolName.endsWith('__prepare_e_comet_feedback')))) {
         try {
-            const cloudStartedAt = _options.cloudStartedAt ?? (_options.cloud?.monotonicNow ?? (() => performance.now()))();
             const { processCloudFeedbackEvent } = await import('./feedback-cloud.mjs');
-            return await processCloudFeedbackEvent(event, { ..._options, cloudStartedAt });
+            return await processCloudFeedbackEvent(event, _options);
         } catch (error) {
-            const safeError = safeHookError(error, toolName.endsWith('__submit_e_comet_feedback') ? 'handoff_submit' : 'handoff_prepare');
+            const submit = toolName.endsWith('__submit_e_comet_feedback');
+            const safeError = safeHookError(error, submit ? 'handoff_submit' : 'handoff_prepare');
             return eventName === 'PreToolUse'
                 ? { exitCode: 0, stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny',
-                    permissionDecisionReason: `${safeError.code}: ${safeError.message} ${JSON.stringify(safeError.details)} This call was blocked before dispatch. ${cloudDenialRecovery(safeError.code)}` } }), stderr: '' }
+                    permissionDecisionReason: `${safeError.code}: ${safeError.message} ${JSON.stringify(safeError.details)} This call was blocked before dispatch. ${cloudDenialRecovery(safeError.code, submit ? 'submit_e_comet_feedback' : 'prepare_e_comet_feedback')}` } }), stderr: '' }
                 : { exitCode: 2, stdout: '', stderr: `${safeError.code}: ${safeError.message} ${JSON.stringify(safeError.details)}` };
         }
     }
@@ -1004,6 +1079,12 @@ export const processHookEvent = async (event, _options = {}) => {
         typeof toolName === 'string' &&
         REMOTE_REPORT_ISSUE_TOOL.test(toolName)
     ) {
+        // A failed authorization already carries the only fact that matters here, and the service
+        // issues very few of them per hour: replacing an exhausted-limit error with a handoff outcome
+        // would hide why the report cannot be sent. Nothing is staged for a result that granted nothing.
+        if (isRecord(toolResponseFromEvent(event)) && toolResponseFromEvent(event).isError === true) {
+            return { exitCode: 0, stdout: '', stderr: '' };
+        }
         let cloudDirectory;
         try {
             const { env = process.env, nowMs = Date.now() } = _options;
@@ -1163,6 +1244,64 @@ export const processHookEvent = async (event, _options = {}) => {
     return { exitCode: 0, stdout: '', stderr: '' };
 };
 
+const feedbackDiagnosticOutcome = (result, eventName) => {
+    if (eventName === 'PostToolUseFailure') return 'failed';
+    try {
+        const output = JSON.parse(result.stdout).hookSpecificOutput;
+        if (output.permissionDecision === 'deny') return 'denied';
+        const replaced = output.updatedToolOutput?.[0]?.text;
+        if (typeof replaced === 'string') {
+            const status = JSON.parse(replaced).status;
+            if (status === 'uncertain') return 'uncertain';
+            if (['failed', 'not_started', 'grant_not_staged'].includes(status)) return 'failed';
+        }
+    } catch { /* Empty successful native Post output is expected. */ }
+    return 'succeeded';
+};
+
+export const processHookEvent = async (event, options = {}) => {
+    const result = await processHookEventAuthoritative(event, options);
+    const eventName = event?.hook_event_name ?? event?.hookEventName;
+    const toolName = event?.tool_name ?? event?.toolName;
+    let cloud = CLOUD_FEEDBACK_TOOL.test(toolName);
+    const target = typeof toolName === 'string' ? toolName.slice(toolName.lastIndexOf('__') + 2) : '';
+    const family = target === 'prepare_e_comet_feedback' ? 'feedback_prepare'
+        : target === 'submit_e_comet_feedback' ? 'feedback_submit'
+            : REMOTE_REPORT_ISSUE_TOOL.test(toolName) ? 'feedback_authorization' : undefined;
+    const routedLocal = cloud || LOCAL_FEEDBACK_TOOL.test(toolName);
+    const routedRemote = eventName === 'PostToolUse' && REMOTE_REPORT_ISSUE_TOOL.test(toolName);
+    if (!family || result.exitCode !== 0 || (!routedRemote && !routedLocal)
+        || !['PreToolUse', 'PostToolUse', 'PostToolUseFailure'].includes(eventName)) return result;
+    if (eventName === 'PostToolUse' && family === 'feedback_prepare'
+        && isRecord(toolResponseFromEvent(event)) && toolResponseFromEvent(event).isError === true) return result;
+    if (eventName === 'PostToolUse' && family === 'feedback_authorization'
+        && isRecord(toolResponseFromEvent(event)) && toolResponseFromEvent(event).isError === true) return result;
+    let decision;
+    let updatedToolOutput = false;
+    if (result.stdout) {
+        try {
+            const output = JSON.parse(result.stdout).hookSpecificOutput;
+            decision = output?.permissionDecision;
+            updatedToolOutput = output?.updatedToolOutput !== undefined;
+            if (family === 'feedback_authorization' && updatedToolOutput) cloud = true;
+        } catch { return result; }
+    }
+    if (eventName === 'PreToolUse' && decision !== 'deny') {
+        try {
+            if (JSON.parse(result.stdout).hookSpecificOutput?.updatedInput === undefined) return result;
+        } catch { return result; }
+    }
+    return withHookDiagnostic(result, () => ({
+        event: eventName, toolFamily: family,
+        handler: cloud && family !== 'feedback_authorization' ? 'feedback_cloud' : 'feedback_handoff',
+        stage: eventName === 'PreToolUse' ? decision === 'deny' ? 'call_denied' : 'input_rewritten'
+            : updatedToolOutput ? 'result_replaced' : family === 'feedback_authorization' ? 'handoff_staged' : 'result_observed',
+        outcome: feedbackDiagnosticOutcome(result, eventName),
+        observedAt: new Date(options.nowMs ?? options.cloud?.now?.() ?? Date.now()).toISOString(),
+        executionPlane: cloud ? 'cloud' : 'native',
+    }));
+};
+
 const readStdin = async () => {
     const chunks = [];
     let bytes = 0;
@@ -1183,7 +1322,7 @@ const readStdin = async () => {
 const main = async () => {
     let result;
     try {
-        result = await processHookEvent(await readStdin(), { cloudStartedAt: 0 });
+        result = await processHookEvent(await readStdin());
     } catch (error) {
         const safeError = safeHookError(error);
         result = { exitCode: 2, stdout: '', stderr: `${safeError.code}: ${safeError.message}` };

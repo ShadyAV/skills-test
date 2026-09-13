@@ -271,8 +271,10 @@ export const resolveChangelogNotice = async ({
         if (store === null) return null;
         // Concurrent calls all read the same stale state. Exclusive creation of one election file per
         // installed version admits a single publisher, and a winner that then reads updated state has
-        // been overtaken and stays silent, so the notice is emitted at most once per update. The
-        // version is hashed into the name because a CalVer with build metadata may exceed a filename.
+        // been overtaken and stays silent. This election covers one installed version; overlapping old
+        // and new roots can repeat a notice (accepted residual in docs/local-agent-architecture.md#accepted-residuals).
+        // The version is hashed into the name because a CalVer with build metadata may exceed a filename.
+        // A hook killed inside its timeout can suppress one version's notice; the next recovers: accepted residual, see docs/local-agent-architecture.md#accepted-residuals.
         const election = join(stateDir, `${CHANGELOG_STATE_NAME}.${sessionKey(installedVersion).slice(0, 32)}.pending`);
         try {
             await writeFile(election, '', { flag: 'wx', mode: 0o600 });
