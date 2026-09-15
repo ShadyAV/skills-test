@@ -876,6 +876,8 @@ const transcriptPathFromEvent = (event) => {
             'The trusted feedback transcript is unavailable.'
         );
     }
+    // Codex may explicitly report that its transcript path is unavailable.
+    if (candidates[0] === null) return undefined;
     return validateTranscriptPath(candidates[0]);
 };
 
@@ -965,15 +967,14 @@ export const prepareInputWithTrustedTranscript = (event) => {
     if (!validateSchemaValue(toolInput, toolInputSchemas.prepare_e_comet_feedback)) {
         throw new FeedbackHandoffError('FEEDBACK_INVALID_INPUT', 'The feedback preparation arguments are invalid.');
     }
-    if (!toolInput.includeTranscript) return { ...toolInput };
     const transcriptPath = transcriptPathFromEvent(event);
-    if (transcriptPath === undefined) {
+    if (transcriptPath === undefined && toolInput.includeTranscript) {
         throw new FeedbackHandoffError(
             'FEEDBACK_TRANSCRIPT_UNAVAILABLE',
             'The trusted feedback transcript is unavailable.'
         );
     }
-    return { ...toolInput, transcriptPath };
+    return { ...toolInput, ...(transcriptPath === undefined ? {} : { transcriptPath }) };
 };
 
 // Hooks receive arguments, not the host's JSON-RPC id/_meta. Leave bounded headroom

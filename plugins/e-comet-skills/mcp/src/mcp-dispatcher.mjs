@@ -47,6 +47,7 @@ import { createConcurrencyLimiter, discoverImageBasket, imageExists, runWithConc
 import { sanitizeClientInfo } from './diagnostic-facts.mjs';
 import { collectDiagnosis } from './diagnose.mjs';
 import { createOperationDiagnostics, decorateOperationResult, operationFactsFromResult } from './operation-diagnostics.mjs';
+import { describeToolContract } from './tool-contracts.mjs';
 
 // Diagnose from a fresh locally-owned status only. Peer text and stale pre-wait snapshots
 // cannot establish a login failure or turn a local bind problem into a marketplace chore.
@@ -1027,6 +1028,21 @@ export const createMcpMessageHandler = ({
                     requestExtensionDiagnosticSnapshot, storageLayout, now,
                     randomUUID: createUuid, ...(collectInstallation ? { collectInstallation } : {}) });
                 sendResult(id, textResult(diagnosis));
+            } },
+        ],
+        [
+            'describe_e_comet_tool',
+            { needsBridge: false, run: async (id, args) => {
+                if (!validateToolArguments('describe_e_comet_tool', args)) {
+                    sendResult(id, textResult(toolFailure(new ToolExecutionError(
+                        'INVALID_TOOL_ARGUMENTS',
+                        'Invalid describe_e_comet_tool arguments.',
+                        'arguments',
+                        false
+                    )), true));
+                    return;
+                }
+                sendResult(id, textResult(describeToolContract(args.name)));
             } },
         ],
         [

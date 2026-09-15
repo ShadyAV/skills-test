@@ -8,6 +8,7 @@ import { assertHookFields, loadHookSecret, verifyHookSignature } from './hook-si
 import { feedbackArtifactStorageUnavailable, loadVerifiedFeedbackArtifact, registerFeedbackArtifact, retireFeedbackArtifact } from './feedback-artifact-store.mjs';
 import { serializeFeedbackMetadata } from './feedback-metadata.mjs';
 import { foldFeedbackLineEndings, redactFeedbackText, renderFeedbackReport } from './feedback-report.mjs';
+import { extractFeedbackToolCalls } from './feedback-tool-calls.mjs';
 import { createFeedbackZip, feedbackZipEntryLayout, feedbackZipEntryNames, feedbackZipFramingBytes } from './feedback-zip.mjs';
 import { assertUploadDestination, putFeedbackArchive } from './feedback-upload.mjs';
 import { FeedbackPreparationError, feedbackSubmissionFailure } from './feedback-errors.mjs';
@@ -136,7 +137,9 @@ export const readTrustedFeedbackTranscript = async (path, options = {}) => {
     }
 };
 
-const readTrustedTranscript = (path, options) => readTrustedFeedbackTranscript(path, options);
+// Diagnostics need all complete records from the same frozen descriptor snapshot. The
+// archive budget applies only after tool names are extracted, when selecting raw history.
+const readTrustedTranscript = (path) => readTrustedFeedbackTranscript(path, { maxBytes: Number.MAX_SAFE_INTEGER });
 
 /** @typedef {(input: { reportBytes: Buffer, metadataBytes: Buffer, transcriptBytes?: Buffer }, options: { maxBytes: number }) => Buffer | Promise<Buffer>} FeedbackZipCreator */
 
@@ -188,7 +191,23 @@ export const prepareECometFeedback = async (input = {}, dependencies = {}) => {
     const atOperation = (operation, action) => {
         try { return action(); } catch (error) { throw withFeedbackOperation(error, operation); }
     };
-    const reportBytes = atOperation('report_render', () => renderFeedbackReport({ kind, summary, details, diagnostics, includeTranscript }));
+    // Validate the authored report before transcript I/O. Reuse this report if no calls
+    // are available, including hosts that cannot provide a path when history is declined.
+    let reportBytes = atOperation('report_render', () => renderFeedbackReport({ kind, summary, details, diagnostics, includeTranscript, toolCalls: [] }));
+    let snapshot;
+    if (transcriptPath !== undefined || includeTranscript === true) {
+        try {
+            const selected = await readTranscript(transcriptPath, { maxBytes: Number.MAX_SAFE_INTEGER });
+            if (!Buffer.isBuffer(selected)) throw transcriptUnavailable();
+            snapshot = completeJsonlTail(selected, selected.length);
+        } catch (error) {
+            throw transcriptUnavailable(error);
+        }
+        const toolCalls = extractFeedbackToolCalls(snapshot);
+        if (toolCalls.length > 0) {
+            reportBytes = atOperation('report_render', () => renderFeedbackReport({ kind, summary, details, diagnostics, includeTranscript, toolCalls }));
+        }
+    }
     const createdAt = atOperation('metadata_encode', () => new Date(now()).toISOString());
     const transcriptIncluded = includeTranscript === true;
     let transcriptTruncated = false;
@@ -201,14 +220,8 @@ export const prepareECometFeedback = async (input = {}, dependencies = {}) => {
     if (transcriptIncluded) {
         const provisionalMetadataBytes = serializeMetadata(0);
         const remaining = Math.max(0, maxBytes - framingBytes - reportBytes.length - provisionalMetadataBytes.length);
-        try {
-            const selected = await readTranscript(transcriptPath, { maxBytes: remaining });
-            if (!Buffer.isBuffer(selected)) throw transcriptUnavailable();
-            transcriptBytes = completeJsonlTail(selected, remaining);
-            transcriptTruncated = truncatedTranscripts.has(transcriptBytes);
-        } catch (error) {
-            throw transcriptUnavailable(error);
-        }
+        transcriptBytes = completeJsonlTail(snapshot, remaining);
+        transcriptTruncated = truncatedTranscripts.has(transcriptBytes);
     }
     const fitSourceBudget = () => {
         for (let attempt = 0; attempt < 3; attempt += 1) {

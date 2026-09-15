@@ -1,6 +1,7 @@
 import { FEEDBACK_KINDS } from './config.mjs';
 import { FeedbackPreparationError } from './feedback-errors.mjs';
 import { selectFeedbackDeviceSnapshot } from './feedback-device-diagnostics.mjs';
+import { isFeedbackToolName } from './feedback-tool-calls.mjs';
 
 const FEEDBACK_KIND_SET = new Set(FEEDBACK_KINDS);
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
@@ -55,14 +56,23 @@ export const redactFeedbackText = (value) => {
 
 export const selectFeedbackDiagnostics = selectFeedbackDeviceSnapshot;
 
-/** @param {{ kind?: string, summary?: string, details?: string, diagnostics?: unknown, includeTranscript?: boolean }} input */
-export const renderFeedbackReport = ({ kind, summary, details, diagnostics, includeTranscript } = {}) => {
+const normalizeToolCalls = (toolCalls) => {
+    if (toolCalls === undefined) return [];
+    if (!Array.isArray(toolCalls) || toolCalls.some((name) => !isFeedbackToolName(name))) {
+        throw new FeedbackPreparationError('FEEDBACK_INPUT_INVALID');
+    }
+    return toolCalls.map((name) => redactFeedbackText(normalizeText(name)));
+};
+
+/** @param {{ kind?: string, summary?: string, details?: string, diagnostics?: unknown, includeTranscript?: boolean, toolCalls?: string[] }} input */
+export const renderFeedbackReport = ({ kind, summary, details, diagnostics, includeTranscript, toolCalls } = {}) => {
     // WHY: report validation owns this safe category before transcript or artifact I/O can begin.
     if (!FEEDBACK_KIND_SET.has(kind)) throw new FeedbackPreparationError('FEEDBACK_INPUT_INVALID');
     if (typeof includeTranscript !== 'boolean') throw new FeedbackPreparationError('FEEDBACK_INPUT_INVALID');
     const normalizedSummary = redactFeedbackText(normalizeText(summary));
     const normalizedDetails = redactFeedbackText(normalizeText(details));
     const selectedDiagnostics = selectFeedbackDiagnostics(diagnostics);
+    const normalizedToolCalls = normalizeToolCalls(toolCalls);
     const report = [
         '<!-- e-comet-feedback:v1 -->',
         '# e-Comet issue report',
@@ -80,6 +90,11 @@ export const renderFeedbackReport = ({ kind, summary, details, diagnostics, incl
         '```json',
         JSON.stringify(selectedDiagnostics),
         '```',
+        '',
+        '## Tool calls',
+        ...(normalizedToolCalls.length === 0
+            ? ['No tool calls were available.']
+            : normalizedToolCalls.map((name, index) => `${index + 1}. ${name}`)),
         '',
         '## Privacy',
         `Transcript: ${includeTranscript ? 'included' : 'not included'}`,

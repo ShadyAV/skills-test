@@ -12,6 +12,7 @@ import {
 } from './config.mjs';
 import { PEER_REJECTION_CODES } from './connection-state.mjs';
 import { FEEDBACK_DIAGNOSTIC_OPERATIONS, FEEDBACK_DIAGNOSTIC_ERROR_TYPES, FEEDBACK_DIAGNOSTIC_SYSTEM_CODES, FEEDBACK_DIAGNOSTIC_MODULES, FEEDBACK_DIAGNOSTIC_REASONS } from './feedback-diagnostics.mjs';
+import { CONTRACT_TOOL_NAMES } from './tool-contracts.mjs';
 import { feedbackCloudTransportSchema, feedbackHostAdapterMarkerSchema } from './feedback-host-adapter.mjs';
 import {
     EXTENSION_UPDATE_URL,
@@ -512,6 +513,22 @@ const operationDiagnosticSchema = described(object({
     schemaVersion: described({ const: 1 }, 'Version of the operation-diagnostic receipt contract.'), handle: described(string, 'Opaque handle for the latest real completion in this MCP process.'), stage: described(string, 'Last operation stage established by the producer.'), outcome: described({ type: 'string', enum: ['succeeded', 'partial', 'failed', 'uncertain'] }, 'Observed terminal outcome without converting uncertainty into failure.'),
     retryDisposition: described({ type: 'string', enum: ['allowed', 'forbidden', 'requires_new_authorization', 'unknown'] }, 'Whether repeating the original operation is safe under its existing authorization contract.'),
 }, ['schemaVersion', 'handle', 'stage', 'outcome', 'retryDisposition']), 'Terminal receipt for one exact real operation completion in this MCP process.');
+export const hookPermissionsFactsSchema = object({
+    host: { const: 'codex' }, context: { const: 'configuration_snapshot' },
+    configured: nonNegativeInteger, enabled: nonNegativeInteger,
+    trust: object({ trusted: nonNegativeInteger, untrusted: nonNegativeInteger, modified: nonNegativeInteger, managed: nonNegativeInteger }, ['trusted', 'untrusted', 'modified', 'managed']),
+    hooks: array(object({
+        eventName: { type: 'string', enum: ['preToolUse', 'postToolUse', 'postToolUseFailure', 'unknown'] },
+        family: { type: 'string', enum: ['browser_authorization_restore', 'browser_authorization_capture', 'update_check', 'feedback_authorization_restore', 'feedback_authorization_capture', 'feedback_cloud_processing', 'feedback_failure_recovery', 'plugin_hook'] },
+        enabled: boolean, trustStatus: { type: 'string', enum: ['trusted', 'untrusted', 'modified', 'managed', 'unknown'] },
+    }, ['eventName', 'family', 'enabled', 'trustStatus'])),
+    warnings: boolean, errors: boolean,
+    status: { type: 'string', enum: ['ready', 'disabled', 'review_required', 'missing', 'incomplete_inventory', 'unsupported'] },
+    inspector: { type: 'string', enum: ['connected_config_reader', 'transient_config_reader'] },
+    installationMatch: { type: 'string', enum: ['matched', 'not_verified'] },
+    currentApplicationMatch: { const: 'not_verified' },
+    missing: array(string, { uniqueItems: true }),
+}, ['host', 'context', 'configured', 'enabled', 'trust', 'hooks', 'warnings', 'errors', 'status', 'inspector', 'installationMatch', 'currentApplicationMatch']);
 const diagnosisCheckSchema = described(object({
     check: described(string, 'Stable identifier for this bounded diagnostic observation.'), state: described({ type: 'string', enum: DIAGNOSTIC_STATES }, 'Observation result, preserving unknown, unsupported, and not_checked separately.'), observedAt: described(string, 'ISO timestamp at which this check made its observation.'), source: described(string, 'Component that produced the check without implying another execution plane.'), executionPlane: described(string, 'Execution plane on which this check actually ran.'),
     facts: described({ type: 'object', additionalProperties: true }, 'Check-specific sanitized facts defined in DIAGNOSTICS.md; omitted when unavailable.'), cause: described(string, 'Safe cause classification defined for this check; omitted when none was observed.'), evidenceRefs: described(array(described(string, 'One safe reference to separately retained evidence, not an embedded path or raw error.')), 'Safe references to separately retained evidence; omitted when none exist.'), nextCheck: described(string, 'Smallest named observation that can discriminate remaining uncertainty.'),
@@ -908,14 +925,34 @@ const feedbackPrepareHostUnavailableSchema = object(
     ['ok', 'status', 'adapter', 'bridgeStatus', 'error']
 );
 
+const describedToolName = described(
+    { type: 'string', enum: [...CONTRACT_TOOL_NAMES] },
+    'Exact local e-Comet tool whose current supported tool contract is requested.'
+);
+
+const describedToolContractSchema = object({
+    schemaVersion: { const: 1 },
+    type: { const: 'e_comet_tool_contract' },
+    requestedTool: { type: 'string', enum: [...CONTRACT_TOOL_NAMES] },
+    appliesTo: array({
+        type: 'string',
+        enum: ['browser_job', ...CONTRACT_TOOL_NAMES, 'report_issue'],
+    }, { minItems: 2, maxItems: 3, uniqueItems: true }),
+    contract: { type: 'string', minLength: 1 },
+}, ['schemaVersion', 'type', 'requestedTool', 'appliesTo', 'contract']);
+
 export const toolInputSchemas = {
     local_bridge_status: described(object({}), 'No arguments: this tool passively observes existing local bridge state.'),
     e_comet_diagnose: described(object({
         scope: described({ type: 'string', enum: ['installation', 'runtime', 'last_operation'] }, 'Evidence domain to inspect: packaged installation, current bridge runtime, or one exact operation receipt.'),
         mode: described({ type: 'string', enum: ['passive', 'safe_probes'] }, 'Passive reads existing facts; safe_probes additionally runs only the explicitly selected allowlisted probes.'),
         operationHandle: described(string, 'Opaque handle returned by the exact terminal operation; required only for last_operation and never substitutes the latest result.'),
-        probes: described(array(described({ type: 'string', enum: ['storage_write', 'extension_snapshot'] }, 'storage_write applies only to installation; extension_snapshot applies only to runtime.'), { uniqueItems: true }), 'Allowlisted probes requested for safe_probes mode; an inapplicable requested probe is not executed and is omitted from checks.'),
+        probes: described(array(described({ type: 'string', enum: ['storage_write', 'extension_snapshot', 'hook_permissions'] }, 'storage_write and hook_permissions apply only to installation; extension_snapshot applies only to runtime.'), { uniqueItems: true }), 'Allowlisted probes requested for safe_probes mode; an inapplicable requested probe is not executed and is omitted from checks.'),
     }, ['scope', 'mode']), 'Selects one diagnostic scope and observation mode without authorizing a business operation.'),
+    describe_e_comet_tool: described(
+        object({ name: describedToolName }, ['name']),
+        'Selects one current supported tool contract without executing a business operation.'
+    ),
     wb_product_card: liveInputSchema(),
     wb_search_by_query: liveInputSchema('productLimitPerQuery', 'query'),
     wb_check_by_query: liveInputSchema(),
@@ -984,6 +1021,7 @@ export const toolInputSchemas = {
 export const toolOutputSchemas = {
     local_bridge_status: bridgeStatusSchema,
     e_comet_diagnose: diagnosisSchema,
+    describe_e_comet_tool: describedToolContractSchema,
     wb_product_card: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(productCardSuccessSchema), toolErrorSchema)),
     wb_search_by_query: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(searchSuccessSchema), toolErrorSchema)),
     wb_check_by_query: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(checkSuccessSchema), toolErrorSchema)),

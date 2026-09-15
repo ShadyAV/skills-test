@@ -213,6 +213,4 @@ const extensionIdOverride = new Set(
         .map((value) => value.trim())
         .filter(Boolean)
 );
-export const ALLOWED_EXTENSION_IDS = EXTENSION_ID_OVERRIDE_ENABLED
-    ? extensionIdOverride
-    : new Set([OFFICIAL_EXTENSION_ID, 'kfdeggpflkbafbjdhbcmfgeibhdnmaio']);
+export const ALLOWED_EXTENSION_IDS = EXTENSION_ID_OVERRIDE_ENABLED ? extensionIdOverride : new Set([OFFICIAL_EXTENSION_ID]);

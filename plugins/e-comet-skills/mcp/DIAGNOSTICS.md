@@ -72,7 +72,7 @@ agent's host context and is not accepted through ordinary process environment or
 
 `e_comet_diagnose` accepts `scope` (`installation`, `runtime`, or `last_operation`) and `mode` (`passive` or
 `safe_probes`). `operationHandle` is required only for `last_operation`. `probes` is an allowlisted array containing
-`storage_write` and/or `extension_snapshot`; a probe runs only in `safe_probes` and only in its applicable scope.
+`storage_write`, `extension_snapshot`, and/or `hook_permissions`; a probe runs only in `safe_probes` and only in its applicable scope.
 The response fields are `schemaVersion:1`, the echoed `scope` and `mode`, `checks: DiagnosticCheck[]`, and optional
 `operation`. Passive installation checks are the in-process doctor checks above. Passive runtime checks are the current
 status collectors; neither path starts lifecycle work. Missing or stale operation handles produce an
@@ -94,7 +94,22 @@ path still identifies the created file; a collision or replacement is preserved.
 not own the diagnostic filename grammar, so they do not promise to remove that rare tiny residual file. The runtime
 `extension_snapshot` probe requests one capability-negotiated, read-only extension snapshot. It returns `unsupported`
 without sending a diagnostic frame when the connected extension or authenticated primary did not advertise the route.
-It makes no marketplace request. Hook trust remains unavailable unless a separately established host binding supplies it.
+It makes no marketplace request.
+
+The installation `hook_permissions` probe asks native Codex `hooks/list` for the e-Comet plugin hooks resolved in the
+MCP process working-directory context. It first attaches to an existing configuration reader and, when none is
+reachable, starts one bounded read-only configuration inspector. The inspector performs only protocol initialization
+and `hooks/list`; it does not create a task, invoke a model or tool, start MCP lifecycle work, or write hook trust and
+enablement. `facts.context` is always `configuration_snapshot`: this proves persisted configuration for that directory,
+not that a hook ran in the current task. `facts.hooks[]` contains only canonical e-Comet hook family, event, enabled
+state, and trust status; commands, paths, hashes, raw warnings and errors, and unrelated hooks are not returned.
+`installationMatch` and `currentApplicationMatch` remain `not_verified`: reading local configuration does not identify
+the installed package copy or the application that owns the current task.
+`status:"ready"` requires the seven Codex-supported e-Comet handlers to be present exactly once, enabled, and trusted
+or managed. `disabled` and `review_required` are separate failures; missing, partial, duplicate, and unknown inventories
+do not pass. Codex currently omits the packaged `PostToolUseFailure` handler because this native host version does not
+support that event. An unreachable native endpoint reports unavailable. Claude Code exposes its read-only `/hooks`
+browser, but this probe establishes no programmatic Cowork trust endpoint.
 
 Every storage-write result is evidence only about the probe's own temporary file, configured target, execution plane,
 and observation time. A code such as `ENOSPC` proves that the corresponding probe step failed for that reason; it does

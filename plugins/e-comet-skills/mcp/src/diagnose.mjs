@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import { join } from 'node:path';
 import { diagnosticCheck } from './diagnostic-facts.mjs';
 import { collectDoctorReport } from './doctor.mjs';
+import { collectCodexHookPermissions } from './codex-hook-permissions.mjs';
 
 const systemCause = (error) => ['EACCES', 'EPERM', 'EROFS'].includes(error?.code) ? 'permission_denied' : 'io_error';
 const step = (operation, state, systemCode, reason) => ({ operation, state, ...(systemCode ? { systemCode } : {}), ...(reason ? { reason } : {}) });
@@ -67,6 +68,7 @@ const probeStorageTarget = async (name, target, { observedAt, randomUUID, fileSy
 export const collectDiagnosis = async (/** @type {any} */ { scope, mode, operationHandle, operationDiagnostics, getBridgeStatus,
     requestExtensionDiagnosticSnapshot,
     storageLayout = {}, probes = [], now = Date.now, randomUUID = () => globalThis.crypto.randomUUID(), collectInstallation = collectDoctorReport,
+    collectHookPermissions = collectCodexHookPermissions,
     fileSystem = fs } = {}) => {
     const observedAt = new Date(now()).toISOString();
     let checks = [];
@@ -81,6 +83,7 @@ export const collectDiagnosis = async (/** @type {any} */ { scope, mode, operati
     }
     if (mode === 'safe_probes') {
         if (scope === 'installation' && probes.includes('storage_write')) for (const [name, target] of Object.entries(storageLayout)) checks.push(await probeStorageTarget(name, target, { observedAt, randomUUID, fileSystem }));
+        if (scope === 'installation' && probes.includes('hook_permissions')) checks.push(await collectHookPermissions({ now }));
         if (scope === 'runtime' && probes.includes('extension_snapshot')) {
             try {
                 const facts = await requestExtensionDiagnosticSnapshot?.();
