@@ -6,6 +6,22 @@ e_comet_diagnose with runtime scope, safe-probes mode, and the extension-snapsho
 
 Negotiated browser-job refusals may include a versioned, closed browser-job rejection record in public error details. The optional diagnostic is present only for the invalid-job reason. This record never contains tokens, claims, user identifiers, paths, or arbitrary error text. Its absence preserves the legacy refusal and does not imply an unknown reason.
 
+| `reason` in `browserJobRejection` | Owner | Supported action |
+| --- | --- | --- |
+| `ecomet_not_authenticated` | user | Activate the extension with the API key from the e-Comet account in the browser where it is connected. Ozon tools already translate this into "the e-Comet extension is not signed in"; WB tools deliver the raw extension message plus this typed reason. |
+| `activation_storage_unavailable` | browser or our defect | No user action; offer a report. |
+| `expired`, `token_reuse` | authorization flow | Obtain a new one-use authorization; never reuse the old one. |
+| `invalid_job` (optional `diagnostic`) | our defect (agent input or contract) | Report; when present, `diagnostic` names the offending field. |
+| `public_key_not_configured`, `invalid_signature`, `issuer_mismatch`, `audience_mismatch`, `subject_mismatch`, `invalid_format`, `invalid_algorithm` | our infrastructure | Report; do not ask the user to change anything. |
+| `user_not_available` | e-Comet session inside the extension | Check activation with the API key; report if it repeats. |
+| `unknown` | — | Report. |
+
+`errorDetails.code:"WB_NOT_AUTHENTICATED"` on a buyer product unit (`products[].units[].errorDetails`)
+is produced by the extension page script when the Wildberries page carries no session token for a request that
+requires one. It is the only code that supports a "not signed in to wildberries.ru" conclusion; the action is to
+sign in in the browser and profile that made the request. A timeout, `WB_FETCH_FAILED` or an expired session token
+does not produce this code.
+
 ## Existing status contract
 
 | Field | Producer and exact meaning | Inference boundary / next discriminating check |
@@ -72,7 +88,7 @@ agent's host context and is not accepted through ordinary process environment or
 
 `e_comet_diagnose` accepts `scope` (`installation`, `runtime`, or `last_operation`) and `mode` (`passive` or
 `safe_probes`). `operationHandle` is required only for `last_operation`. `probes` is an allowlisted array containing
-`storage_write`, `extension_snapshot`, and/or `hook_permissions`; a probe runs only in `safe_probes` and only in its applicable scope.
+`storage_write`, `extension_snapshot`, `hook_permissions`, `extension_install`, and/or `codex_mcp_auth`; a probe runs only in `safe_probes` and only in its applicable scope.
 The response fields are `schemaVersion:1`, the echoed `scope` and `mode`, `checks: DiagnosticCheck[]`, and optional
 `operation`. Passive installation checks are the in-process doctor checks above. Passive runtime checks are the current
 status collectors; neither path starts lifecycle work. Missing or stale operation handles produce an
@@ -110,6 +126,48 @@ or managed. `disabled` and `review_required` are separate failures; missing, par
 do not pass. Codex currently omits the packaged `PostToolUseFailure` handler because this native host version does not
 support that event. An unreachable native endpoint reports unavailable. Claude Code exposes its read-only `/hooks`
 browser, but this probe establishes no programmatic Cowork trust endpoint.
+
+The installation `extension_install` probe reads Chromium profile metadata with plain file reads and never spawns a
+process. It checks the user-data roots of Google Chrome, Microsoft Edge, Yandex Browser and Opera for the current
+platform; other browsers are not checked, and their absence from `facts` means unchecked, not uninstalled. Per
+browser it lists profiles from `Local State` (`profile.info_cache`), falling back to `Default` alone with
+`profileSource:"default_only"`, which means partial coverage. Opera also checks its root profile when a `Default`
+directory is absent. A profile counts as installed when a matching extension manifest is found under
+`Extensions/<id>/<version>/manifest.json`. Its state follows a closed table read from `Secure Preferences`
+(or `Preferences`): `disable_reasons` empty → enabled; `disable_reasons` a non-empty integer list → disabled; the
+legacy `state:1` without `disable_reasons` → enabled; anything else, including a missing record, → unknown. A file
+that reads fine can still leave the state unknown; that is neither a read failure nor "disabled".
+
+The fact shape is
+`extension_install.facts.{extensionId,browsers[].{browser,profileSource,profilesChecked,installedProfiles,enabledProfiles,unknownProfiles,readFailures,versions[]}}`.
+`browser` is `chrome`, `edge`, `yandex`, or `opera`; `versions` holds distinct versions read from manifests in the
+safe version grammar, never directory names. Profile names, paths, account e-mails and every other preference field
+never enter the facts. States: `passed` when every found root was read; `unknown` with cause `permission_denied` or
+`io_error` when a read failed (partial facts are retained); `not_checked` with cause `directory_absent` when no known
+root exists. Inference boundaries: `installedProfiles:0` everywhere supports absence only in checked browsers and
+profiles when metadata reads succeeded; partial or failed reads do not support absence. "Disabled" is supported only
+when `installedProfiles>0`, `enabledProfiles:0` and `unknownProfiles:0` with complete metadata reads; any
+`unknownProfiles>0` forbids the word "disabled". `enabledProfiles>0` names a candidate browser, not the browser the
+user works in; the probe never proves that the extension is connected or activated. Activation of a connected
+extension is observed by the runtime `extension_snapshot` probe (`activationIdentity.state`), because an unactivated
+extension still connects to the local bridge.
+
+The installation `codex_mcp_auth` probe makes one bounded native `codex mcp list --json` call. It reports a
+configuration snapshot, not the current Desktop runtime connection, and selects exact configured names from our
+`.mcp.json`: `e-comet` (remote) and `e-comet-local` (local). The CLI provides no plugin identity, so a name match
+cannot attest that a server belongs to this installed plugin; `installationMatch` stays `not_verified`. Facts are
+`{host:"codex",context:"configuration_snapshot",inspector:"cli_config_reader",status,installationMatch:"not_verified",servers[].{role,authStatus,enabled?}}`.
+`authStatus` is `unknown`, `unsupported`, `notLoggedIn`, `bearerToken`, or `oAuth`, normalized from CLI snake-case
+words. `enabled` appears only when the CLI supplied a boolean. A disabled remote entry is not treated as active
+sign-in evidence. Server names, URLs, credentials, foreign server metadata and tool schemas are never returned.
+`status` is `not_logged_in` (configuration reports sign-in incomplete; qualify the statement),
+`credentials_present` (stored credentials are unvalidated; a real `info` call or host auth error can clarify),
+`unknown_status`, `missing` (no remote name; state `not_checked`, cause `missing`), or `ambiguous` (duplicate target
+names; state `unknown`, cause `unknown`). Malformed JSON, nonzero exit, unavailable CLI, timeout or oversized output
+yields `not_checked`, cause `unavailable`, without projecting raw output. The command has a 20 s and 2 MiB stdout
+bound; its child is killed on timeout or excess output. Firm Connect wording needs a real host authorization error
+or notice, not this CLI snapshot. The Codex Desktop action is Settings → Plugins → e-Comet MCP Tools → server E-comet
+→ Connect; CLI commands are not user actions. Claude uses its own host connector evidence.
 
 Every storage-write result is evidence only about the probe's own temporary file, configured target, execution plane,
 and observation time. A code such as `ENOSPC` proves that the corresponding probe step failed for that reason; it does

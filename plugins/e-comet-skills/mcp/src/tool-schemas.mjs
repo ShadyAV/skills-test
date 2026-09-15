@@ -529,6 +529,27 @@ export const hookPermissionsFactsSchema = object({
     currentApplicationMatch: { const: 'not_verified' },
     missing: array(string, { uniqueItems: true }),
 }, ['host', 'context', 'configured', 'enabled', 'trust', 'hooks', 'warnings', 'errors', 'status', 'inspector', 'installationMatch', 'currentApplicationMatch']);
+export const codexMcpAuthFactsSchema = object({
+    host: { const: 'codex' }, context: { const: 'configuration_snapshot' },
+    inspector: { const: 'cli_config_reader' },
+    status: { type: 'string', enum: ['not_logged_in', 'credentials_present', 'unknown_status', 'missing', 'ambiguous'] },
+    installationMatch: { const: 'not_verified' },
+    servers: array(object({
+        role: { type: 'string', enum: ['remote', 'local'] },
+        authStatus: { type: 'string', enum: ['unknown', 'unsupported', 'notLoggedIn', 'bearerToken', 'oAuth'] },
+        enabled: boolean,
+    }, ['role', 'authStatus'])),
+}, ['host', 'context', 'inspector', 'status', 'installationMatch', 'servers']);
+export const extensionInstallFactsSchema = object({
+    extensionId: { type: 'string', pattern: '^[a-p]{32}$' },
+    browsers: array(object({
+        browser: { type: 'string', enum: ['chrome', 'edge', 'yandex', 'opera'] },
+        profileSource: { type: 'string', enum: ['local_state', 'default_only'] },
+        profilesChecked: nonNegativeInteger, installedProfiles: nonNegativeInteger, enabledProfiles: nonNegativeInteger,
+        unknownProfiles: nonNegativeInteger, readFailures: nonNegativeInteger,
+        versions: array({ type: 'string', pattern: '^[\\w.+-]{1,32}$' }, { uniqueItems: true }),
+    }, ['browser', 'profileSource', 'profilesChecked', 'installedProfiles', 'enabledProfiles', 'unknownProfiles', 'readFailures', 'versions'])),
+}, ['extensionId', 'browsers']);
 const diagnosisCheckSchema = described(object({
     check: described(string, 'Stable identifier for this bounded diagnostic observation.'), state: described({ type: 'string', enum: DIAGNOSTIC_STATES }, 'Observation result, preserving unknown, unsupported, and not_checked separately.'), observedAt: described(string, 'ISO timestamp at which this check made its observation.'), source: described(string, 'Component that produced the check without implying another execution plane.'), executionPlane: described(string, 'Execution plane on which this check actually ran.'),
     facts: described({ type: 'object', additionalProperties: true }, 'Check-specific sanitized facts defined in DIAGNOSTICS.md; omitted when unavailable.'), cause: described(string, 'Safe cause classification defined for this check; omitted when none was observed.'), evidenceRefs: described(array(described(string, 'One safe reference to separately retained evidence, not an embedded path or raw error.')), 'Safe references to separately retained evidence; omitted when none exist.'), nextCheck: described(string, 'Smallest named observation that can discriminate remaining uncertainty.'),
@@ -947,7 +968,7 @@ export const toolInputSchemas = {
         scope: described({ type: 'string', enum: ['installation', 'runtime', 'last_operation'] }, 'Evidence domain to inspect: packaged installation, current bridge runtime, or one exact operation receipt.'),
         mode: described({ type: 'string', enum: ['passive', 'safe_probes'] }, 'Passive reads existing facts; safe_probes additionally runs only the explicitly selected allowlisted probes.'),
         operationHandle: described(string, 'Opaque handle returned by the exact terminal operation; required only for last_operation and never substitutes the latest result.'),
-        probes: described(array(described({ type: 'string', enum: ['storage_write', 'extension_snapshot', 'hook_permissions'] }, 'storage_write and hook_permissions apply only to installation; extension_snapshot applies only to runtime.'), { uniqueItems: true }), 'Allowlisted probes requested for safe_probes mode; an inapplicable requested probe is not executed and is omitted from checks.'),
+        probes: described(array(described({ type: 'string', enum: ['storage_write', 'extension_snapshot', 'hook_permissions', 'codex_mcp_auth', 'extension_install'] }, 'storage_write, hook_permissions, codex_mcp_auth and extension_install apply only to installation; extension_snapshot applies only to runtime.'), { uniqueItems: true }), 'Allowlisted probes requested for safe_probes mode; an inapplicable requested probe is not executed and is omitted from checks.'),
     }, ['scope', 'mode']), 'Selects one diagnostic scope and observation mode without authorizing a business operation.'),
     describe_e_comet_tool: described(
         object({ name: describedToolName }, ['name']),

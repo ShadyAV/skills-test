@@ -39,7 +39,8 @@ const hookDiagnosticGuidance =
 export const serverInstructions =
     'Choose the typed local tool by intent; do not start with browser_job. For a selected signed tool, retrieve its full contract once with describe_e_comet_tool when not already available in this task, before browser_job; then immediately call the local tool. For images, call wb_product_images directly. ' +
     'Live WB stock/sizes/price/card/description/characteristics: wb_product_card; search ranking/top products: wb_search_by_query; one article for queries: wb_check_by_query; recommendations/similar products: wb_recommendations_by_product; seller review export: wb_seller_reviews. Ozon promotion: ozon_seller_promotion_report (one) or ozon_seller_promotion_reports (package); analytics by period/day: ozon_seller_analytics_report. ' +
-    proactiveFeedbackOffer + updateNoticeGuidance + hookDiagnosticGuidance;
+    proactiveFeedbackOffer + updateNoticeGuidance + hookDiagnosticGuidance +
+    'When remote e-Comet tools are missing, ask the host or run the codex_mcp_auth probe before any authorization claim. ';
 
 export const tools = [
     {
@@ -78,7 +79,7 @@ export const tools = [
     {
         name: 'e_comet_diagnose',
         description:
-            'Collect scoped technical evidence for installation, current runtime, or the exact last operation handle. Diagnosis never pre-approves or repeats a business tool. A passed check applies only to its named observation plane and time. Never repeat an indeterminate create or upload. Safe probes run only when explicitly requested and do not obtain authorization or call a marketplace. The installation hook_permissions probe reads native Codex configuration state; it does not prove that a hook ran in the current task and is unavailable for Cowork. For exact input, output, field, and enum semantics, load the packaged mcp/DIAGNOSTICS.md reference.',
+            'Collect scoped technical evidence for installation, current runtime, or the exact last operation handle. Diagnosis never pre-approves or repeats a business tool. A passed check applies only to its named observation plane and time. Never repeat an indeterminate create or upload. Safe probes run only when explicitly requested and do not obtain authorization or call a marketplace. The installation extension_install probe reads Chromium profile metadata to report where the e-Comet extension is installed and enabled; it never proves the extension is connected. The installation hook_permissions and codex_mcp_auth probes read native Codex configuration state (hook trust; remote-server sign-in status); they do not prove that a hook ran or that the current task is authorized, and are unavailable for Cowork. For exact input, output, field, and enum semantics, load the packaged mcp/DIAGNOSTICS.md reference.',
         inputSchema: toolInputSchemas.e_comet_diagnose,
         outputSchema: toolOutputSchemas.e_comet_diagnose,
         annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },

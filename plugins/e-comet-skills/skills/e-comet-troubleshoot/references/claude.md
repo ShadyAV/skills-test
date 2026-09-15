@@ -11,4 +11,7 @@ Current official documentation verifies Cowork → Customize → Plugins for ins
 
 The `hook_permissions` safe probe reads local Codex configuration. Do not use its result as Claude Code or Cowork hook evidence; use the host-specific checks above.
 
+- Tool discovery: `ToolSearch` exists in Cowork and the Code tab. A fresh Cowork task's start list may hold no e-Comet tools; search with a large limit or by exact name before reporting absence.
+- Connector state: Cowork `ListConnectors` (`list_connectors` in the Code tab) reports `installState`, `connected`, and `enabledInChat` for the remote connector. The plugin's local server does not appear there. In the Code tab a session's `connected` status before a call proves little; `needs_auth` can appear only after the first failed call. A host authorization error on the call is stronger evidence. Connected connector tokens normally refresh automatically.
+
 Official sources, verified 2026-09-13: [Claude hooks](https://code.claude.com/docs/en/hooks), [plugin loading and CLI inspection](https://code.claude.com/docs/en/plugins-reference), [Cowork plugin installation](https://support.claude.com/en/articles/13837440-use-plugins-in-claude), and [Cowork local/cloud architecture](https://support.claude.com/en/articles/14479288-claude-cowork-architecture-overview).

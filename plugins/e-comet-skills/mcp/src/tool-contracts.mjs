@@ -43,7 +43,8 @@ const localBridgeFailureGuidance =
 const buyerOutcomeGuidance =
     'When stopReason is "rate_limited", Wildberries returned HTTP 429: no new work was scheduled after that observation, while already in-flight requests may finish. ' +
     'Report the retained results and skipped work; never automatically repeat the job. skipped:true identifies work that was not dispatched, not proof that a product is missing. ' +
-    'Use item errorDetails.code/stage/retryable when present to explain the observed failure; the legacy error text is supplementary. Do not infer missing login, extension failure or a root cause from a timeout alone. ';
+    'Use item errorDetails.code/stage/retryable when present to explain the observed failure; the legacy error text is supplementary. Do not infer missing login, extension failure or a root cause from a timeout alone. ' +
+    'errorDetails.code WB_NOT_AUTHENTICATED means the page had no Wildberries session: the user must sign in to wildberries.ru in the browser and profile that made the request, where the connected extension runs; a browser found by the extension_install probe is only a hint. It is the only code that supports a "not signed in" conclusion; a timeout or WB_FETCH_FAILED does not. Then obtain a new authorization and retry only on the user\'s decision. ';
 
 const productCardContract =
             'Get live Wildberries product-card data by article ID. Use for Russian requests about остаток, остатки, сток, наличие, склады, размеры, цена, карточка товара, описание, характеристики, or склейка. ' +

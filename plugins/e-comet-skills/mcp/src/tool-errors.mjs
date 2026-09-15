@@ -44,7 +44,7 @@ const OZON_EXTENSION_OUTDATED_DETAIL_KEYS = Object.freeze([
 // строка вывела бы сообщение за MAX_SAFE_MESSAGE_LENGTH, и весь терминальный ответ выродился бы в
 // нераспознанную ошибку вместо диагноза.
 const SAFE_EXTENSION_VERSION = /^[\w.+-]{1,32}$/;
-const safeExtensionVersion = (value) => (typeof value === 'string' && SAFE_EXTENSION_VERSION.test(value) ? value : undefined);
+export const safeExtensionVersion = (value) => (typeof value === 'string' && SAFE_EXTENSION_VERSION.test(value) ? value : undefined);
 
 const isOzonExtensionOutdatedDetails = (value) =>
     typeof value === 'object' &&
