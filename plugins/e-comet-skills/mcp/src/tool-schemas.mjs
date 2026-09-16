@@ -513,7 +513,7 @@ const operationDiagnosticSchema = described(object({
     schemaVersion: described({ const: 1 }, 'Version of the operation-diagnostic receipt contract.'), handle: described(string, 'Opaque handle for the latest real completion in this MCP process.'), stage: described(string, 'Last operation stage established by the producer.'), outcome: described({ type: 'string', enum: ['succeeded', 'partial', 'failed', 'uncertain'] }, 'Observed terminal outcome without converting uncertainty into failure.'),
     retryDisposition: described({ type: 'string', enum: ['allowed', 'forbidden', 'requires_new_authorization', 'unknown'] }, 'Whether repeating the original operation is safe under its existing authorization contract.'),
 }, ['schemaVersion', 'handle', 'stage', 'outcome', 'retryDisposition']), 'Terminal receipt for one exact real operation completion in this MCP process.');
-export const hookPermissionsFactsSchema = object({
+const hookPermissionsInventoryFactsSchema = object({
     host: { const: 'codex' }, context: { const: 'configuration_snapshot' },
     configured: nonNegativeInteger, enabled: nonNegativeInteger,
     trust: object({ trusted: nonNegativeInteger, untrusted: nonNegativeInteger, modified: nonNegativeInteger, managed: nonNegativeInteger }, ['trusted', 'untrusted', 'modified', 'managed']),
@@ -524,11 +524,19 @@ export const hookPermissionsFactsSchema = object({
     }, ['eventName', 'family', 'enabled', 'trustStatus'])),
     warnings: boolean, errors: boolean,
     status: { type: 'string', enum: ['ready', 'disabled', 'review_required', 'missing', 'incomplete_inventory', 'unsupported'] },
-    inspector: { type: 'string', enum: ['connected_config_reader', 'transient_config_reader'] },
+    inspector: { const: 'transient_config_reader' },
     installationMatch: { type: 'string', enum: ['matched', 'not_verified'] },
     currentApplicationMatch: { const: 'not_verified' },
     missing: array(string, { uniqueItems: true }),
 }, ['host', 'context', 'configured', 'enabled', 'trust', 'hooks', 'warnings', 'errors', 'status', 'inspector', 'installationMatch', 'currentApplicationMatch']);
+const hookPermissionsFailureFactsSchema = object({
+    host: { const: 'codex' }, context: { const: 'configuration_probe' }, inspector: { const: 'transient_config_reader' },
+    status: { const: 'failed' }, failure: object({
+        reason: { type: 'string', enum: ['timeout', 'process_missing', 'permission_denied', 'process_closed', 'protocol_error', 'response_too_large'] },
+        phase: { type: 'string', enum: ['startup', 'initialize', 'request', 'response', 'transport'] },
+    }, ['reason', 'phase']),
+}, ['host', 'context', 'inspector', 'status', 'failure']);
+export const hookPermissionsFactsSchema = objectUnion(hookPermissionsInventoryFactsSchema, hookPermissionsFailureFactsSchema);
 export const codexMcpAuthFactsSchema = object({
     host: { const: 'codex' }, context: { const: 'configuration_snapshot' },
     inspector: { const: 'cli_config_reader' },

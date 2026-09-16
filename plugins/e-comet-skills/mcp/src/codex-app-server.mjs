@@ -1,13 +1,18 @@
 import { spawn } from 'node:child_process';
 
 const MAX_PROTOCOL_BYTES = 1024 * 1024;
-const protocolError = (message) => Object.assign(new Error(message), { code: 'CODEX_APP_SERVER_PROTOCOL' });
+const inspectionError = (reason, phase) => Object.assign(new Error('Codex configuration inspection failed.'), {
+    code: 'CODEX_APP_SERVER_INSPECTION', reason, phase,
+});
+const processFailureReason = (/** @type {any} */ error) => error?.code === 'ENOENT' ? 'process_missing'
+    : ['EACCES', 'EPERM'].includes(error?.code) ? 'permission_denied' : 'protocol_error';
+const startupError = (error) => inspectionError(processFailureReason(error), 'startup');
 
 // A bounded JSON-RPC request. Each query owns and closes its inspector process.
 export const queryCodexAppServer = ({ args, method, params, timeoutMs, spawnProcess = spawn, clientName }) => new Promise((resolve, reject) => {
     let child;
     try { child = spawnProcess('codex', ['app-server', ...args], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true }); }
-    catch (error) { reject(error); return; }
+    catch (error) { reject(startupError(error)); return; }
     let buffer = '';
     let settled = false;
     const finish = (error, value) => {
@@ -17,15 +22,18 @@ export const queryCodexAppServer = ({ args, method, params, timeoutMs, spawnProc
         try { child.kill(); } catch { /* best effort */ }
         if (error) reject(error); else resolve(value);
     };
-    const timer = setTimeout(() => finish(new Error(`${method} timed out`)), timeoutMs);
-    child.on('error', (error) => finish(error));
-    child.stdin.on('error', (error) => finish(error));
-    child.stdout.on('error', (error) => finish(error));
-    child.on('close', () => finish(new Error(`app-server closed before ${method}`)));
+    const timer = setTimeout(() => finish(inspectionError('timeout', 'response')), timeoutMs);
+    child.on('error', (error) => {
+        const reason = processFailureReason(error);
+        finish(inspectionError(reason, reason === 'protocol_error' ? 'transport' : 'startup'));
+    });
+    child.stdin.on('error', () => finish(inspectionError('protocol_error', 'transport')));
+    child.stdout.on('error', () => finish(inspectionError('protocol_error', 'transport')));
+    child.on('close', () => finish(inspectionError('process_closed', 'response')));
     child.stdout.on('data', (chunk) => {
         if (settled) return;
         buffer += chunk;
-        if (Buffer.byteLength(buffer) > MAX_PROTOCOL_BYTES) { finish(protocolError(`${method} response too large`)); return; }
+        if (Buffer.byteLength(buffer) > MAX_PROTOCOL_BYTES) { finish(inspectionError('response_too_large', 'response')); return; }
         for (;;) {
             const newline = buffer.indexOf('\n');
             if (newline < 0 || settled) break;
@@ -33,11 +41,11 @@ export const queryCodexAppServer = ({ args, method, params, timeoutMs, spawnProc
             let response;
             try { response = JSON.parse(line); } catch { continue; }
             if (response.id === 1) {
-                if (response.error) { finish(protocolError('initialize failed')); return; }
+                if (response.error) { finish(inspectionError('protocol_error', 'initialize')); return; }
                 child.stdin.write(`${JSON.stringify({ method: 'initialized' })}\n`);
                 child.stdin.write(`${JSON.stringify({ id: 2, method, params })}\n`);
             } else if (response.id === 2) {
-                if (response.error) finish(protocolError(`${method} failed`));
+                if (response.error) finish(inspectionError('protocol_error', 'request'));
                 else finish(undefined, response.result);
             }
         }
@@ -46,13 +54,3 @@ export const queryCodexAppServer = ({ args, method, params, timeoutMs, spawnProc
         clientInfo: { name: clientName, version: '1' }, capabilities: { experimentalApi: true },
     } })}\n`);
 });
-
-export const withCodexAppServer = async ({ method, params, proxyTimeoutMs, inspectorTimeoutMs, spawnProcess = spawn, clientName }) => {
-    try {
-        return { result: await queryCodexAppServer({ args: ['proxy'], method, params, timeoutMs: proxyTimeoutMs, spawnProcess, clientName }),
-            inspector: 'connected_config_reader' };
-    } catch {
-        return { result: await queryCodexAppServer({ args: ['--stdio'], method, params, timeoutMs: inspectorTimeoutMs, spawnProcess, clientName }),
-            inspector: 'transient_config_reader' };
-    }
-};

@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { diagnosticCheck } from './diagnostic-facts.mjs';
 import { hookPermissionsFactsSchema, validateSchemaValue } from './tool-schemas.mjs';
-import { withCodexAppServer } from './codex-app-server.mjs';
+import { queryCodexAppServer } from './codex-app-server.mjs';
 
 const PLUGIN_ID = 'e-comet-skills';
 const EXPECTED_HOOKS = new Set([
@@ -31,7 +31,7 @@ const samePath = (left, right) => {
     try { return process.platform === 'win32' ? resolve(left).toLowerCase() === resolve(right).toLowerCase() : resolve(left) === resolve(right); }
     catch { return false; }
 };
-export const summarizeCodexHooks = (result, cwd, inspector = 'connected_config_reader') => {
+export const summarizeCodexHooks = (result, cwd, inspector = 'transient_config_reader') => {
     const matching = Array.isArray(result?.data) ? result.data.filter((entry) => samePath(entry?.cwd, cwd)) : [];
     if (matching.length !== 1) return { state: 'unknown', cause: 'unknown', facts: {
         host: 'codex', context: 'configuration_snapshot', configured: 0, enabled: 0,
@@ -67,13 +67,18 @@ export const summarizeCodexHooks = (result, cwd, inspector = 'connected_config_r
 };
 
 export const collectCodexHookPermissions = async (/** @type {any} */ { cwd = process.cwd(), observedAt, now = Date.now,
-    timeoutMs = 2_000, spawnProcess = spawn } = {}) => {
-    let outcome;
-    try { outcome = await withCodexAppServer({ method: 'hooks/list', params: { cwds: [cwd] }, proxyTimeoutMs: timeoutMs,
-        inspectorTimeoutMs: timeoutMs, spawnProcess, clientName: 'e-comet-hook-permissions' }); }
-    catch { return diagnosticCheck({ check: 'hook_permissions', state: 'not_checked', observedAt: observedAt ?? new Date(now()).toISOString(),
-        source: 'codex_hooks_list', executionPlane: 'device', cause: 'unavailable' }); }
-    const summary = summarizeCodexHooks(outcome.result, cwd, outcome.inspector);
+    timeoutMs = 5_000, spawnProcess = spawn } = {}) => {
+    let result;
+    try { result = await queryCodexAppServer({ args: ['--stdio'], method: 'hooks/list', params: { cwds: [cwd] }, timeoutMs,
+        spawnProcess, clientName: 'e-comet-hook-permissions' }); }
+    catch (error) {
+        const failure = { reason: error?.reason ?? 'protocol_error', phase: error?.phase ?? 'startup' };
+        const facts = { host: 'codex', context: 'configuration_probe', inspector: 'transient_config_reader', status: 'failed', failure };
+        const cause = failure.reason === 'permission_denied' ? 'permission_denied' : failure.reason === 'process_missing' ? 'missing' : 'unavailable';
+        return diagnosticCheck({ check: 'hook_permissions', state: 'not_checked', observedAt: observedAt ?? new Date(now()).toISOString(),
+            source: 'codex_hooks_list', executionPlane: 'device', cause, facts });
+    }
+    const summary = summarizeCodexHooks(result, cwd);
     if (summary.facts && !validateSchemaValue(summary.facts, hookPermissionsFactsSchema)) return diagnosticCheck({ check: 'hook_permissions',
         state: 'unknown', observedAt: observedAt ?? new Date(now()).toISOString(), source: 'codex_hooks_list', executionPlane: 'device', cause: 'unknown' });
     return diagnosticCheck({ check: 'hook_permissions', observedAt: observedAt ?? new Date(now()).toISOString(), source: 'codex_hooks_list', executionPlane: 'device', ...summary });

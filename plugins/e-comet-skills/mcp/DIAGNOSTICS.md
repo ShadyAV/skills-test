@@ -113,18 +113,23 @@ without sending a diagnostic frame when the connected extension or authenticated
 It makes no marketplace request.
 
 The installation `hook_permissions` probe asks native Codex `hooks/list` for the e-Comet plugin hooks resolved in the
-MCP process working-directory context. It first attaches to an existing configuration reader and, when none is
-reachable, starts one bounded read-only configuration inspector. The inspector performs only protocol initialization
+MCP process working-directory context. It starts one bounded read-only `app-server --stdio` configuration inspector;
+the default five-second diagnostic wait accommodates cold startup beyond two seconds and does not retry. The inspector performs only protocol initialization
 and `hooks/list`; it does not create a task, invoke a model or tool, start MCP lifecycle work, or write hook trust and
-enablement. `facts.context` is always `configuration_snapshot`: this proves persisted configuration for that directory,
-not that a hook ran in the current task. `facts.hooks[]` contains only canonical e-Comet hook family, event, enabled
+enablement. On success, `facts.context` is `configuration_snapshot`: this proves persisted configuration for that directory,
+not that a hook ran in the current task. Successful `facts.hooks[]` contains only canonical e-Comet hook family, event, enabled
 state, and trust status; commands, paths, hashes, raw warnings and errors, and unrelated hooks are not returned.
 `installationMatch` and `currentApplicationMatch` remain `not_verified`: reading local configuration does not identify
 the installed package copy or the application that owns the current task.
 `status:"ready"` requires the seven Codex-supported e-Comet handlers to be present exactly once, enabled, and trusted
 or managed. `disabled` and `review_required` are separate failures; missing, partial, duplicate, and unknown inventories
 do not pass. Codex currently omits the packaged `PostToolUseFailure` handler because this native host version does not
-support that event. An unreachable native endpoint reports unavailable. Claude Code exposes its read-only `/hooks`
+support that event. If the inspector cannot return a snapshot, the check is `not_checked` and inventory fields are omitted.
+Its separate `configuration_probe` facts contain only `status:"failed"` and a closed failure `{reason,phase}`: reason is
+`timeout`, `process_missing`, `permission_denied`, `process_closed`, `protocol_error`, or `response_too_large`; phase is
+`startup`, `initialize`, `request`, `response`, or `transport`. These values distinguish the observed probe boundary
+without preserving commands, paths, server messages, or raw errors. They do not establish disabled or untrusted hooks.
+Claude Code exposes its read-only `/hooks`
 browser, but this probe establishes no programmatic Cowork trust endpoint.
 
 The installation `extension_install` probe reads Chromium profile metadata with plain file reads and never spawns a
