@@ -96,8 +96,23 @@ const probeProfile = async (fileSystem, join, path, extensionId, facts) => {
     else if (classification === 'unknown') facts.unknownProfiles += 1;
 };
 
-const probeBrowser = async (fileSystem, join, target, extensionId) => {
+// Chromium rewrites `Local State` and each profile's preference files while the browser runs, so the
+// newest successfully observed modification time is a recency hint for those metadata files. The
+// files are stat'ed, never read, and the result is a whole number of days, never a timestamp.
+const DAY_MS = 24 * 60 * 60 * 1000;
+const newestModification = async (fileSystem, paths) => {
+    let newest;
+    for (const path of paths) {
+        try { const { mtimeMs } = await fileSystem.stat(path); if (Number.isFinite(mtimeMs) && (newest === undefined || mtimeMs > newest)) newest = mtimeMs; }
+        catch { /* absence or denial: recency stays unknown for this file */ }
+    }
+    return newest;
+};
+const daysAgo = (mtimeMs, nowMs) => Math.max(0, Math.floor((nowMs - mtimeMs) / DAY_MS));
+
+const probeBrowser = async (fileSystem, join, target, extensionId, nowMs) => {
     const facts = { browser: target.browser, profileSource: 'local_state', profilesChecked: 0, installedProfiles: 0, enabledProfiles: 0, unknownProfiles: 0, readFailures: 0, versions: new Set(), failureCause: undefined };
+    const activityFiles = [join(target.path, 'Local State')];
     const local = await readJson(fileSystem, join(target.path, 'Local State'));
     let names = [];
     if (local.ok && isRecord(local.value?.profile?.info_cache)) names = Object.keys(local.value.profile.info_cache);
@@ -115,11 +130,20 @@ const probeBrowser = async (fileSystem, join, target, extensionId) => {
         const path = join(target.path, name);
         const result = await directory(fileSystem, path);
         if (result.cause) { recordFailure(facts, result.cause); continue; }
-        if (result.exists) { facts.profilesChecked += 1; await probeProfile(fileSystem, join, path, extensionId, facts); }
-        else if (target.browser === 'opera') { facts.profilesChecked += 1; await probeProfile(fileSystem, join, target.path, extensionId, facts); break; }
+        if (result.exists) {
+            facts.profilesChecked += 1;
+            activityFiles.push(join(path, 'Preferences'), join(path, 'Secure Preferences'));
+            await probeProfile(fileSystem, join, path, extensionId, facts);
+        } else if (target.browser === 'opera') {
+            facts.profilesChecked += 1;
+            activityFiles.push(join(target.path, 'Preferences'), join(target.path, 'Secure Preferences'));
+            await probeProfile(fileSystem, join, target.path, extensionId, facts);
+            break;
+        }
     }
+    const newest = await newestModification(fileSystem, activityFiles);
     const { failureCause: cause, versions, ...publicFacts } = facts;
-    return { facts: { ...publicFacts, versions: [...versions].sort() }, cause };
+    return { facts: { ...publicFacts, versions: [...versions].sort(), ...(newest === undefined ? {} : { lastUsedDaysAgo: daysAgo(newest, nowMs) }) }, cause };
 };
 
 export const probeBrowserExtensionInstall = async (/** @type {any} */ { observedAt, now = Date.now, platform = process.platform, env = process.env,
@@ -132,7 +156,7 @@ export const probeBrowserExtensionInstall = async (/** @type {any} */ { observed
         const root = await directory(fileSystem, target.path);
         if (root.cause) { cause ??= root.cause; continue; }
         if (!root.exists) continue;
-        const result = await probeBrowser(fileSystem, join, target, extensionId);
+        const result = await probeBrowser(fileSystem, join, target, extensionId, now());
         cause ??= result.cause;
         browsers.push(result.facts);
     }

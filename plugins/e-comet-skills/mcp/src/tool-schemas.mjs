@@ -556,6 +556,7 @@ export const extensionInstallFactsSchema = object({
         profilesChecked: nonNegativeInteger, installedProfiles: nonNegativeInteger, enabledProfiles: nonNegativeInteger,
         unknownProfiles: nonNegativeInteger, readFailures: nonNegativeInteger,
         versions: array({ type: 'string', pattern: '^[\\w.+-]{1,32}$' }, { uniqueItems: true }),
+        lastUsedDaysAgo: nonNegativeInteger,
     }, ['browser', 'profileSource', 'profilesChecked', 'installedProfiles', 'enabledProfiles', 'unknownProfiles', 'readFailures', 'versions'])),
 }, ['extensionId', 'browsers']);
 const diagnosisCheckSchema = described(object({

@@ -63,9 +63,17 @@ first, and read DIAGNOSTICS.md for its coverage and inference boundaries. When m
 `installedProfiles:0` in all checked browsers supports absence only in those checked profiles. Ask which browser
 the user uses; if it is one of the checked browsers, installing from its extension store is a candidate action.
 Installed with `enabledProfiles:0` and `unknownProfiles:0` supports enabling it in the named browser only when
-metadata reads are complete. `enabledProfiles>0` names a candidate browser: for a Wildberries page flow, suggest
-starting that browser and opening any wildberries.ru page; the extension connects by itself. If
-`profileSource:"default_only"`, explain that only its Default profile was checked. If any `unknownProfiles>0`,
+metadata reads are complete. `enabledProfiles>0` names a candidate browser, never the browser the user works in.
+When more than one browser holds the extension, do not pick one: list what was found per browser and give each
+action as a condition, "if you work in Chrome, enable it there; if in Yandex Browser, open a wildberries.ru page
+there". Use `lastUsedDaysAgo` to order the candidates and mention when a browser's checked metadata files have not
+changed for a long time; it is a hint from file modification times: it says when the browser's files last changed,
+not that the browser is in use or open. When the extension is connected, `extension.version` from
+`local_bridge_status` is the version of the
+connected copy; a checked browser whose `versions[]` contains it is the likely source, still a candidate: unchecked
+browsers, unchecked profiles and unpacked copies can hold the same version. Say which found copy matches the
+connected version and which does not, instead of suggesting the other browser. If `profileSource:"default_only"`, explain that only its
+Default profile was checked. If any `unknownProfiles>0`,
 read failure, `unknown`, or `not_checked` remains, do not call the extension disabled or absent everywhere. Ask
 which browser holds it and whether it is enabled, then suggest opening a wildberries.ru page there for a
 Wildberries page flow. Other browsers, including Firefox, are not covered by the probe; Firefox is unsupported
@@ -77,7 +85,11 @@ found copy does not prove which browser is connected.
 
 When the extension is connected and a signed tool fails at the `authorization` stage, or the user asks to check
 installation or activation, run runtime `extension_snapshot` first. `activationIdentity.state:"absent"` supports
-activating the extension with the API key from the e-Comet account in that browser. For other typed refusals use the
+activating the extension with the API key from the e-Comet account in that browser. If the snapshot returns
+`unsupported`, the route does not offer it: either the connected extension build or the primary local process the
+route goes through lacks it, and the result does not say which. Do not prescribe an extension update from this
+alone and do not stop there. Run installation `extension_install` next for the install and enable facts above, and
+say that activation cannot be checked on this route; `unsupported` is not evidence about activation or installation. For other typed refusals use the
 `browserJobRejection.reason` table in DIAGNOSTICS.md. `errorDetails.code:"WB_NOT_AUTHENTICATED"` on a buyer product
 unit supports signing in to wildberries.ru in the browser and profile that made the request; the snapshot is only
 a hint about which browser that was.

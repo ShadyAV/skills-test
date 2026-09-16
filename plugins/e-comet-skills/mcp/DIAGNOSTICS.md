@@ -110,7 +110,10 @@ path still identifies the created file; a collision or replacement is preserved.
 not own the diagnostic filename grammar, so they do not promise to remove that rare tiny residual file. The runtime
 `extension_snapshot` probe requests one capability-negotiated, read-only extension snapshot. It returns `unsupported`
 without sending a diagnostic frame when the connected extension or authenticated primary did not advertise the route.
-It makes no marketplace request.
+It makes no marketplace request. `unsupported` says nothing about installation or activation, and it does not
+identify which side lacks the route, the extension build or the primary process; it does not support prescribing an
+extension update. The next discriminating check is the installation `extension_install` probe; activation stays
+unobserved on this route.
 
 The installation `hook_permissions` probe asks native Codex `hooks/list` for the e-Comet plugin hooks resolved in the
 MCP process working-directory context. It starts one bounded read-only `app-server --stdio` configuration inspector;
@@ -144,7 +147,17 @@ legacy `state:1` without `disable_reasons` → enabled; anything else, including
 that reads fine can still leave the state unknown; that is neither a read failure nor "disabled".
 
 The fact shape is
-`extension_install.facts.{extensionId,browsers[].{browser,profileSource,profilesChecked,installedProfiles,enabledProfiles,unknownProfiles,readFailures,versions[]}}`.
+`extension_install.facts.{extensionId,browsers[].{browser,profileSource,profilesChecked,installedProfiles,enabledProfiles,unknownProfiles,readFailures,versions[],lastUsedDaysAgo?}}`.
+`lastUsedDaysAgo` is the whole number of days since the newest modification time of the browser's `Local State` and
+the checked profiles' preference files, obtained by `stat` without reading them. It measures file age, not browser
+use: Chromium rewrites those files while the browser runs, so a recent value usually means a recent run, but other
+software can touch the files too, and an old value proves only that the successfully stat'ed checked files have not
+changed. It is omitted when none of those files could be stat'ed. It never identifies the browser the user is working
+in right now: order candidates by
+it and mention a long-unchanged browser, but leave the choice to the user. When the extension is connected,
+`extension.version` in `local_bridge_status` is the connected copy's version; a checked browser whose `versions[]`
+contains it is a likely candidate, not the proven source: unchecked browsers, unchecked profiles and unpacked copies
+can hold the same version.
 `browser` is `chrome`, `edge`, `yandex`, or `opera`; `versions` holds distinct versions read from manifests in the
 safe version grammar, never directory names. Profile names, paths, account e-mails and every other preference field
 never enter the facts. States: `passed` when every found root was read; `unknown` with cause `permission_denied` or
