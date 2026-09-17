@@ -56,10 +56,10 @@ export const createPeerTokenSource = ({ load, loadOrCreate, readDeadlineMs = 100
     return {
         observation: () => latestObservation,
         async resolve({ allowCreate }) {
-            if (cachedToken) {
-                latestObservation = Object.freeze({ state: 'passed', observedAt: new Date(now()).toISOString() });
-                return { ok: true, token: cachedToken };
-            }
+            // Наблюдение остаётся от настоящего чтения файла. Переставлять его на попадании в кэш
+            // значило бы показывать свежее «passed» для пары, которую с тех пор могли удалить или
+            // закрыть, — при том что диск здесь не трогали.
+            if (cachedToken) return { ok: true, token: cachedToken };
             const readResult = await sharedRead();
             if (readResult?.ok) {
                 cachedToken ??= readResult.token;

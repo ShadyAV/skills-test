@@ -1,4 +1,10 @@
-const TOOL_NAME = /^[A-Za-z][A-Za-z0-9._:-]*(?:__[A-Za-z][A-Za-z0-9._:-]*)*$/;
+// One linear pass over an untrusted transcript name: `_` belongs to the class, so `__`-joined host
+// prefixes still match without an alternation whose overlapping paths backtrack exponentially. Real
+// names are short identifiers — the longest observed are Cowork's URL-slug MCP names such as
+// `mcp__https_mcp_e-comet_io_mcp__report_issue` (43) — so this cap keeps threefold headroom while
+// stopping one absurd transcript value from spending the report's share of the archive budget.
+const TOOL_NAME_MAX_LENGTH = 256;
+const TOOL_NAME = /^[A-Za-z][A-Za-z0-9._:-]*$/;
 const FEEDBACK_TOOL_SUFFIXES = new Set([
     'prepare_e_comet_feedback',
     'report_issue',
@@ -12,7 +18,8 @@ const isFeedbackTool = (name) => {
     return FEEDBACK_TOOL_SUFFIXES.has(suffix);
 };
 
-export const isFeedbackToolName = (value) => typeof value === 'string' && TOOL_NAME.test(value);
+export const isFeedbackToolName = (value) =>
+    typeof value === 'string' && value.length <= TOOL_NAME_MAX_LENGTH && TOOL_NAME.test(value);
 
 const acceptedToolName = (value) => isFeedbackToolName(value) && !isFeedbackTool(value);
 

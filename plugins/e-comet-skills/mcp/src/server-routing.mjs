@@ -14,6 +14,12 @@ export const createDiagnosticSnapshotRoute = ({ connections, sendExtension = sen
         connections.peerSocket.send(JSON.stringify({ type: 'peer_diagnostic_snapshot', requestId, protocolVersion: 1 }));
         return;
     }
+    // «Спросить некого» и «спрашивать нечем» — разные наблюдения. Пока подключённого расширения нет
+    // ни здесь, ни у первичного процесса, отказ по возможности приписал бы пользователю устаревшую
+    // сборку, хотя наблюдается только отсутствие подключения — самый частый бытовой случай.
+    if (!(connections.peerReady && connections.peerExtensionReady === true && connections.peerSocket?.readyState === WS_OPEN)) {
+        throw new ToolExecutionError('EXTENSION_DISCONNECTED', 'No connected e-Comet extension is reachable for a diagnostic snapshot.', 'extension', false);
+    }
     throw new ToolExecutionError('UNSUPPORTED_CAPABILITY', 'Extension diagnostic snapshots are unavailable on this route.', 'extension', false);
 };
 

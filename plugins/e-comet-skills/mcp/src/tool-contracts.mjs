@@ -3,13 +3,16 @@ import { OZON_PROMOTION_MIN_EXTENSION_VERSION } from './extension-vocabulary.mjs
 const authorizationWorkflow =
     'This typed local tool owns the workflow: select it based on user intent, then call the remote e-Comet browser_job exactly once with the matching typed job and immediately invoke this tool. ' +
     'In Claude and Codex, model-authored arguments must omit both triggerUrl and trigger_url so the trusted host hook can inject the transport-only authorization immediately before this local call. ' +
-    'Never decode, print, edit, copy, or expose the authorization. Do not infer an authorization failure from client status: attempt the actual remote call, retry tool discovery up to three times if necessary, and report only the confirmed error in user-friendly language. ';
+    'Never decode, print, edit, copy, or expose the authorization. Do not infer an authorization failure from client status: attempt the actual remote call and report only the confirmed error in user-friendly language. If a tool is missing from the catalog, repeat the host tool search up to three times; never repeat browser_job or this tool to make an error disappear. ';
 
 const ozonAuthorizationWorkflow =
     'This typed local tool owns the Ozon workflow. First call the remote browser_job({job:{type:"ozon_seller_promotion_report",dateFrom,dateTo}}) exactly once, then immediately invoke this tool with the same dates. ' +
     'The trusted Claude or Codex host hook injects the opaque transport-only triggerUrl; model-authored arguments must omit both triggerUrl and trigger_url. Never decode, print, edit, copy, or expose that authorization. ' +
     'local_bridge_status reports legacy WB browser context and must not be used to gate this Ozon tool; the Ozon capability and typed operation result are authoritative. ' +
     'Its extension version and Ozon capability fields are informational only: use them to explain a failure, never to skip or pre-approve this call. ';
+
+const ozonHandoffGuidance =
+    'OZON_AUTHORIZATION_REJECTED with the message "The trusted browser-job hook did not provide Ozon authorization." is the same missing handoff; treat it exactly like BROWSER_JOB_HANDOFF_REQUIRED. ';
 
 const ozonPackageAuthorizationWorkflow = (browserJobType, businessArguments) =>
     `Call the remote browser_job exactly once with job {type:"${browserJobType}",${businessArguments}}, then invoke this local tool exactly once with the identical business array. ` +
@@ -23,7 +26,8 @@ const ozonPackageAuthorizationWorkflow = (browserJobType, businessArguments) =>
     'OZON_EXECUTION_INTERRUPTED identifies an internal phase-delivery failure, not a Seller login or route diagnosis. ' +
     'Use its safe phase/createOutcome evidence: confirmed creation must not be repeated automatically; skipped work has not run. Offer an e-Comet bug report for persistent internal failures. ' +
     'The extension automatically uses the first ready Seller context and pins its company for this package; never ask the user to focus a tab. A fresh authorization uses the then-current context and does not guarantee the previous company. ' +
-    'Do not use local_bridge_status to pre-approve or skip the signed operation; the family capability and typed operation result are authoritative. ';
+    'Do not use local_bridge_status to pre-approve or skip the signed operation; the family capability and typed operation result are authoritative. ' +
+    ozonHandoffGuidance;
 
 const resultPathGuidance =
     'resultPath is only a fallback for the current call when the compact result is insufficient; it is not a cache and must not be reused for another request. ' +
@@ -40,6 +44,10 @@ const localBridgeFailureGuidance =
     'LOCAL_BRIDGE_* failures describe observed local pairing or listener problems, not marketplace login failures. Use the returned cause and local_bridge_status; do not prescribe opening a WB tab or obtaining repeated authorizations for a local permissions/bind failure. ' +
     'For LOCAL_STORAGE_FAILED, use details.systemCode and the message when supplied to distinguish access, space/quota and path conflicts; do not infer the cause from the generic code alone. ';
 
+const rejectionAndHandoffGuidance =
+    'BROWSER_JOB_HANDOFF_REQUIRED (stage handoff) means this tool ran without hook-injected authorization: the host hook did not run or did not rewrite the input, because the plugin hooks are not trusted, are disabled, changed after a plugin update, or the host does not run plugin hooks in this task. It is not a marketplace, extension or account failure. Do not call browser_job or this tool again until that is resolved; each repeat spends one signed authorization. On Codex run e_comet_diagnose with installation scope, safe_probes and the hook_permissions probe and follow its result: on disabled or review_required the user enables or trusts the e-Comet handlers in Settings → Plugins → Personal → e-Comet MCP Tools → Hooks, on ready or not_checked the cause is not established; on Claude Code /hooks lists the configured hooks; on Cowork verify that the plugin is installed and enabled and start a new task. retryable:true never authorizes an automatic repeat. ' +
+    'A whole-call BROWSER_JOB_REJECTED or BROWSER_JOB_ACCOUNT_MISMATCH (for Ozon tools, OZON_AUTHORIZATION_REJECTED with the same details) carries details.browserJobRejection.reason: ecomet_not_authenticated means the extension is not activated, and the user activates it with the API key from the e-Comet account (https://app.e-comet.io/account) in the browser where it is connected; subject_mismatch (code BROWSER_JOB_ACCOUNT_MISMATCH) means the extension is activated with a different e-Comet account than the connector, and the user uses the same account on both; expired or token_reuse need one fresh browser_job on the user\'s decision; every other reason is an e-Comet defect to report, not a user change. See the packaged mcp/DIAGNOSTICS.md section "Missing authorization handoff". ';
+
 const buyerOutcomeGuidance =
     'When stopReason is "rate_limited", Wildberries returned HTTP 429: no new work was scheduled after that observation, while already in-flight requests may finish. ' +
     'Report the retained results and skipped work; never automatically repeat the job. skipped:true identifies work that was not dispatched, not proof that a product is missing. ' +
@@ -48,7 +56,7 @@ const buyerOutcomeGuidance =
 
 const productCardContract =
             'Get live Wildberries product-card data by article ID. Use for Russian requests about остаток, остатки, сток, наличие, склады, размеры, цена, карточка товара, описание, характеристики, or склейка. ' +
-            authorizationWorkflow + localBridgeFailureGuidance + buyerOutcomeGuidance +
+            authorizationWorkflow + localBridgeFailureGuidance + buyerOutcomeGuidance + rejectionAndHandoffGuidance +
             'Authorize with job {type:"product_card",product_ids:[integer,...]}; use 1-1000 positive product IDs. Read products[]. For price use priceRub.product; priceRub.basic is the crossed-out/basic price. ' +
             'For stock use quantity.total, quantity.byWarehouse, and quantity.bySize. Warehouse names are already in warehouse; if absent, display wh <id>. Use colors for merged articles, options for characteristics, and description for description. ' +
             'Translate raw field names for the user and render booleans as yes/no. A product-level ok:false is a failed WB request, not proof that the product does not exist. Report partial item errors. ' +
@@ -58,7 +66,7 @@ const productCardContract =
 
 const searchContract =
             'Get live Wildberries search results, top products, and positions for one or more phrases. Use for Russian requests about поиск, поисковая выдача, позиция товара, место по запросу, or топ товаров. ' +
-            authorizationWorkflow + localBridgeFailureGuidance + buyerOutcomeGuidance +
+            authorizationWorkflow + localBridgeFailureGuidance + buyerOutcomeGuidance + rejectionAndHandoffGuidance +
             'Authorize with job {type:"search_by_query",queries:[{query:string,pages:integer},...]}; use at most 50 pages for each query and 1000 pages total. Start with 1 page for a top list or 2-3 pages when depth is unspecified. ' +
             'For a targeted rank check, put phrases in remote job.queries and target article IDs in local productNmIds. For a top N list, use productLimitPerQuery:N. ' +
             'Read queries[].pages[].products. Use globalPosition only when globalPositionsComplete is true; position is page-local. promoted is always boolean: promoted:true means реклама (paid placement), promoted:false means органика. ' +
@@ -73,7 +81,7 @@ const searchContract =
 
 const checkContract =
             'Check whether one Wildberries article appears in search results for 1-100 phrases. Use for Russian requests about проверка артикула в выдаче, находится ли артикул по фразе, индексируется ли товар, or по каким запросам виден товар. ' +
-            authorizationWorkflow + localBridgeFailureGuidance + buyerOutcomeGuidance +
+            authorizationWorkflow + localBridgeFailureGuidance + buyerOutcomeGuidance + rejectionAndHandoffGuidance +
             'Authorize with job {type:"check_by_query",product_id:integer,queries:[string,...]}; send one positive product ID and 1-100 unique non-empty phrases. Page depth is fixed by the service; do not supply it. ' +
             'Read queries[] separately. For found:true, report only that the product was found for the phrase. For found:false, report only that the product was not found for the phrase. ' +
             'Do not mention pagesChecked, completionReason, page limits, or brand-filtered depth unless the user explicitly asks for diagnostics. Never present pagesChecked as a page, position, rank, or search depth in ordinary unfiltered search. ' +
@@ -83,7 +91,7 @@ const checkContract =
 
 const recommendationsContract =
             'Get live Wildberries recommendation shelves for source article IDs and check whether specific products occur in them. Use for Russian requests about рекомендации, похожие товары, рекомендательная полка, соседние товары, or whether a product встречается в рекомендациях. ' +
-            authorizationWorkflow + localBridgeFailureGuidance + buyerOutcomeGuidance +
+            authorizationWorkflow + localBridgeFailureGuidance + buyerOutcomeGuidance + rejectionAndHandoffGuidance +
             'Authorize with job {type:"recommendations_by_product",products:[{product_id:integer,pages?:integer},...]}; use unique source product IDs, at most 50 pages for each product, and 1000 pages total; an omitted pages value counts as 50 toward the total. ' +
             'For первые N recommendations, explicitly request pages: 1 and pass local productLimitPerSource: N. Omit pages only when the user explicitly needs the whole discovered shelf within local limits. ' +
             'For a membership check, put исходные товары in remote job.products and целевые товары in local productNmIds. Read articles[].pages[].products and group results by sourceNmId. ' +
@@ -96,7 +104,8 @@ const sellerReviewsContract =
             'Call remote browser_job once: job {type:"seller_reviews",exports:[{product_id?:int,dateFrom?,dateTo?,isAnswered?:bool,ratings?:[1|2|3|4|5,...],content?},...],org?}, then immediately this tool. ' +
             'Trusted Claude/Codex hooks inject authorization: omit triggerUrl/trigger_url; never decode, print, edit, copy or expose it. ' +
             'Never infer authorization failure from status. ' +
-            'Retry discovery up to 3x; explain confirmed errors. ' +
+            rejectionAndHandoffGuidance +
+            'Repeat host tool search up to 3x for a missing tool; never repeat browser_job or this tool; explain confirmed errors. ' +
             'One array includes all filters. ' +
             'Omit product_id/ratings/content for all products/ratings/content; content:"media" means photo/video. ' +
             'Omitted dates mean all time; otherwise both inclusive YYYY-MM-DD dates. ' +
@@ -123,6 +132,8 @@ const promotionContract =
             'Download the Ozon Seller promotion analytics report for one requested period as one XLSX workbook. ' +
             ozonAuthorizationWorkflow +
             reportDeliveryGuidance +
+            rejectionAndHandoffGuidance +
+            ozonHandoffGuidance +
             'Use canonical inclusive dateFrom/dateTo dates with at most 89 inclusive days. One call produces one period and one workbook. ' +
             'Neighboring analytics are unavailable in this first tool: it does not provide product, traffic, finance, campaign, or other Ozon reports. ' +
             'The operation may create a saved report in Ozon, but it does not change products, campaigns, budgets, or seller settings. ' +
@@ -138,6 +149,7 @@ const promotionPackageContract =
             'Download an ordered package of up to 50 Ozon Seller promotion analytics XLSX workbooks. ' +
             ozonPackageAuthorizationWorkflow('ozon_seller_promotion_reports', 'periods:[{dateFrom,dateTo},...]') +
             reportDeliveryGuidance +
+            rejectionAndHandoffGuidance +
             'Each period independently uses canonical inclusive dates and may contain at most 89 inclusive days. Periods may overlap and need not be chronological; exact duplicates are rejected and there is no aggregate-day cap. ' +
             'One browser authorization and one local call cover the whole ordered package. Completed workbooks remain available when later items fail; return every completed resource_link and report every failed and skipped item from the ordered result. ' +
             'The operation may create saved reports in Ozon, but it does not change products, campaigns, budgets, or seller settings. ' +
@@ -147,6 +159,7 @@ const analyticsPackageContract =
             'Download an ordered package of up to 50 Ozon Seller general analytics XLSX workbooks. ' +
             ozonPackageAuthorizationWorkflow('ozon_seller_analytics_report', 'reports:[{dateFrom,dateTo,breakdown},...]') +
             reportDeliveryGuidance +
+            rejectionAndHandoffGuidance +
             'Each report independently uses canonical inclusive dates, an explicit breakdown:"period" or breakdown:"daily", at most 731 inclusive days, and the signed Moscow issuance window. ' +
             'daily means daily rows inside one XLSX workbook for that report; never create one report per day unless the user explicitly requests separate date items. ' +
             'REPORT_TERMINAL_FAILURE may include details.marketplaceErrorCode: retain this observed numeric code in a consented bug report, but never invent its business meaning or treat it as permission to retry create. ' +

@@ -303,7 +303,18 @@ export const createExtensionProtocol = ({
         }
 
         const parsed = parseExtensionServerMessage(message);
-        if (!parsed.ok) return;
+        if (!parsed.ok) {
+            // Коррелированный снимок неверной формы закрывает свой запрос сразу. Без этого он
+            // оседал молча, e_comet_diagnose ждал полный таймаут и сообщал причину «unknown»
+            // вместо наблюдаемого отказа по форме. Содержимое payload не логируем.
+            if (state.extensionHandshakeComplete && message?.type === MESSAGE_TYPES.diagnosticSnapshotResult &&
+                typeof message.id === 'string' && requestBroker.hasPendingDiagnosticSnapshot?.(message.id)) {
+                requestBroker.rejectDiagnosticSnapshot(message.id, new ToolExecutionError('EXTENSION_DIAGNOSTIC_INVALID',
+                    'The extension diagnostic snapshot did not match the negotiated diagnostic_snapshot_v1 shape.', 'extension', false));
+                log(`rejected malformed diagnostic snapshot result ${message.id}`);
+            }
+            return;
+        }
         message = parsed.message;
 
         const { payload, type } = message;

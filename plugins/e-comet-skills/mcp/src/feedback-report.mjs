@@ -64,8 +64,8 @@ const normalizeToolCalls = (toolCalls) => {
     return toolCalls.map((name) => redactFeedbackText(normalizeText(name)));
 };
 
-/** @param {{ kind?: string, summary?: string, details?: string, diagnostics?: unknown, includeTranscript?: boolean, toolCalls?: string[] }} input */
-export const renderFeedbackReport = ({ kind, summary, details, diagnostics, includeTranscript, toolCalls } = {}) => {
+/** @param {{ kind?: string, summary?: string, details?: string, diagnostics?: unknown, includeTranscript?: boolean, toolCalls?: string[], toolCallsTruncated?: boolean }} input */
+export const renderFeedbackReport = ({ kind, summary, details, diagnostics, includeTranscript, toolCalls, toolCallsTruncated } = {}) => {
     // WHY: report validation owns this safe category before transcript or artifact I/O can begin.
     if (!FEEDBACK_KIND_SET.has(kind)) throw new FeedbackPreparationError('FEEDBACK_INPUT_INVALID');
     if (typeof includeTranscript !== 'boolean') throw new FeedbackPreparationError('FEEDBACK_INPUT_INVALID');
@@ -92,6 +92,9 @@ export const renderFeedbackReport = ({ kind, summary, details, diagnostics, incl
         '```',
         '',
         '## Tool calls',
+        // Preparation reads a session bounded by the feedback package budget, so an oversized
+        // session leaves only its newest records. Say so rather than implying a complete list.
+        ...(toolCallsTruncated === true ? ['Only the newest part of the session was read; earlier tool calls are not listed.'] : []),
         ...(normalizedToolCalls.length === 0
             ? ['No tool calls were available.']
             : normalizedToolCalls.map((name, index) => `${index + 1}. ${name}`)),

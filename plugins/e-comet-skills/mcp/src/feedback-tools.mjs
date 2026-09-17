@@ -137,10 +137,6 @@ export const readTrustedFeedbackTranscript = async (path, options = {}) => {
     }
 };
 
-// Diagnostics need all complete records from the same frozen descriptor snapshot. The
-// archive budget applies only after tool names are extracted, when selecting raw history.
-const readTrustedTranscript = (path) => readTrustedFeedbackTranscript(path, { maxBytes: Number.MAX_SAFE_INTEGER });
-
 /** @typedef {(input: { reportBytes: Buffer, metadataBytes: Buffer, transcriptBytes?: Buffer }, options: { maxBytes: number }) => Buffer | Promise<Buffer>} FeedbackZipCreator */
 
 /**
@@ -154,7 +150,7 @@ export const prepareECometFeedback = async (input = {}, dependencies = {}) => {
     const {
         getBridgeStatus,
         registerArtifact = registerFeedbackArtifact,
-        readTranscript = readTrustedTranscript,
+        readTranscript = readTrustedFeedbackTranscript,
         verifySignature = verifyHookFields,
         createZip = createFeedbackZip,
         now = Date.now,
@@ -196,16 +192,25 @@ export const prepareECometFeedback = async (input = {}, dependencies = {}) => {
     let reportBytes = atOperation('report_render', () => renderFeedbackReport({ kind, summary, details, diagnostics, includeTranscript, toolCalls: [] }));
     let snapshot;
     if (transcriptPath !== undefined || includeTranscript === true) {
+        let toolCalls;
+        let toolCallsTruncated;
         try {
-            const selected = await readTranscript(transcriptPath, { maxBytes: Number.MAX_SAFE_INTEGER });
+            // One bounded read serves both the diagnostic tool names and the optional raw history.
+            // The shared package budget is the most any archive can carry, so a host session larger
+            // than it yields its newest complete records instead of loading and decoding a snapshot
+            // that no archive could hold. Extraction stays inside this boundary: every failure on
+            // the transcript path, including decoding, belongs to the transcript category.
+            const selected = await readTranscript(transcriptPath, { maxBytes: FEEDBACK_MAX_BYTES });
             if (!Buffer.isBuffer(selected)) throw transcriptUnavailable();
-            snapshot = completeJsonlTail(selected, selected.length);
+            snapshot = completeJsonlTail(selected, FEEDBACK_MAX_BYTES);
+            toolCallsTruncated = truncatedTranscripts.has(snapshot);
+            toolCalls = extractFeedbackToolCalls(snapshot);
         } catch (error) {
             throw transcriptUnavailable(error);
         }
-        const toolCalls = extractFeedbackToolCalls(snapshot);
-        if (toolCalls.length > 0) {
-            reportBytes = atOperation('report_render', () => renderFeedbackReport({ kind, summary, details, diagnostics, includeTranscript, toolCalls }));
+        // The per-archive budget applies only afterwards, when raw history is selected.
+        if (toolCalls.length > 0 || toolCallsTruncated) {
+            reportBytes = atOperation('report_render', () => renderFeedbackReport({ kind, summary, details, diagnostics, includeTranscript, toolCalls, toolCallsTruncated }));
         }
     }
     const createdAt = atOperation('metadata_encode', () => new Date(now()).toISOString());

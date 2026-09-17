@@ -8,11 +8,12 @@ Negotiated browser-job refusals may include a versioned, closed browser-job reje
 
 | `reason` in `browserJobRejection` | Owner | Supported action |
 | --- | --- | --- |
-| `ecomet_not_authenticated` | user | Activate the extension with the API key from the e-Comet account in the browser where it is connected. Ozon tools already translate this into "the e-Comet extension is not signed in"; WB tools deliver the raw extension message plus this typed reason. |
+| `ecomet_not_authenticated` | user | Activate the extension with the API key from the e-Comet account (https://app.e-comet.io/account) in the browser where it is connected. Ozon tools already translate this into "the e-Comet extension is not signed in"; WB tools deliver the raw extension message plus this typed reason. |
+| `subject_mismatch` (delivered with code `BROWSER_JOB_ACCOUNT_MISMATCH`) | user | The extension is activated with a different e-Comet account than the one that authorized the job through the remote connector. Activate the extension with the API key of the same e-Comet account as the connector (https://app.e-comet.io/account), or connect the remote connector with the account the extension uses; then one fresh authorization on the user's decision. Ozon tools already translate this into "signed in to a different e-Comet account"; WB tools deliver the raw extension message plus this typed reason. |
 | `activation_storage_unavailable` | browser or our defect | No user action; offer a report. |
 | `expired`, `token_reuse` | authorization flow | Obtain a new one-use authorization; never reuse the old one. |
 | `invalid_job` (optional `diagnostic`) | our defect (agent input or contract) | Report; when present, `diagnostic` names the offending field. |
-| `public_key_not_configured`, `invalid_signature`, `issuer_mismatch`, `audience_mismatch`, `subject_mismatch`, `invalid_format`, `invalid_algorithm` | our infrastructure | Report; do not ask the user to change anything. |
+| `public_key_not_configured`, `invalid_signature`, `issuer_mismatch`, `audience_mismatch`, `invalid_format`, `invalid_algorithm` | our infrastructure | Report; do not ask the user to change anything. |
 | `user_not_available` | e-Comet session inside the extension | Check activation with the API key; report if it repeats. |
 | `unknown` | — | Report. |
 
@@ -21,6 +22,10 @@ is produced by the extension page script when the Wildberries page carries no se
 requires one. It is the only code that supports a "not signed in to wildberries.ru" conclusion; the action is to
 sign in in the browser and profile that made the request. A timeout, `WB_FETCH_FAILED` or an expired session token
 does not produce this code.
+
+## Missing authorization handoff
+
+A signed local tool answers `code:"BROWSER_JOB_HANDOFF_REQUIRED"` (`stage:"handoff"`, `retryable:true`) when it was called without `triggerUrl`; the Ozon tools answer `OZON_AUTHORIZATION_REJECTED` with the message "The trusted browser-job hook did not provide Ozon authorization." for the same condition. Model-authored arguments must omit `triggerUrl`, so this means the host `PreToolUse` hook did not run or did not rewrite the input: the plugin hooks are not trusted, are disabled, changed after a plugin update, or the host does not run plugin hooks in this task. It is not a marketplace, extension or e-Comet account failure, and `browser_job` was already called once. Do not call `browser_job` or the local tool again until the hook condition is resolved: each repeat spends one signed authorization and fails the same way. On an observed Codex host, run installation `hook_permissions` (`safe_probes`) and follow its `disabled`, `review_required` and `not_checked` guidance below; the user action is Settings → Plugins → Personal → e-Comet MCP Tools → Hooks. On Claude Code, `/hooks` lists the configured hooks. On Cowork there is no hook-trust control: verify that the plugin is installed and enabled in Customize → Plugins → Yours and start a new task. The receipt is `outcome:"failed"`, `retryDisposition:"unknown"`.
 
 ## Existing status contract
 
@@ -113,7 +118,11 @@ without sending a diagnostic frame when the connected extension or authenticated
 It makes no marketplace request. `unsupported` says nothing about installation or activation, and it does not
 identify which side lacks the route, the extension build or the primary process; it does not support prescribing an
 extension update. The next discriminating check is the installation `extension_install` probe; activation stays
-unobserved on this route.
+unobserved on this route. `not_checked` with cause `unavailable` (source `device_process`) means no connected extension
+was reachable, directly or through the primary, so nothing was asked: the observation is a missing connection, never a
+missing capability, and the bridge status names the next step. `failed` with cause `corrupt` means a connected extension
+answered with a snapshot that did not match the negotiated `diagnostic_snapshot_v1` shape; the request settles at once
+rather than at its deadline, and the mismatch is an e-Comet defect to report, not a user change.
 
 The installation `hook_permissions` probe asks native Codex `hooks/list` for the e-Comet plugin hooks resolved in the
 MCP process working-directory context. It starts one bounded read-only `app-server --stdio` configuration inspector;
@@ -223,7 +232,10 @@ latest real completion in that MCP process and becomes stale when the next real 
 calls do not replace it. `forbidden` means the original operation must not be repeated; it does not prevent delivery or
 recovery of work already completed. `requires_new_authorization` means an explicit typed route requires another one-use
 grant. `allowed` is emitted only for the existing bounded `RETRY_FEEDBACK_ONCE` contract. Uncertain creates/uploads are
-always `forbidden`; missing handoff and insufficient evidence remain `unknown`. Receipts never enter peer-wire failures,
+always `forbidden`; missing handoff and insufficient evidence remain `unknown`. When a result carries both a
+top-level `retryable` flag and `operationDiagnostic.retryDisposition`, the `retryDisposition` governs repeats:
+`retryable:true` only says the failure class can clear once its prerequisite is fixed, never that the same call may
+be repeated without a user decision. Receipts never enter peer-wire failures,
 authorization input, nested errors, cloud-only adapter markers, or cloud-only preparation/finalization results.
 
 For decorated results, the JSON text representation is the same value as `structuredContent`; existing resource links

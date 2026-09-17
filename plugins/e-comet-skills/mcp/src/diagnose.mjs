@@ -7,6 +7,16 @@ import { collectCodexMcpAuth } from './codex-mcp-auth.mjs';
 import { probeBrowserExtensionInstall } from './browser-extension-install.mjs';
 
 const systemCause = (error) => ['EACCES', 'EPERM', 'EROFS'].includes(error?.code) ? 'permission_denied' : 'io_error';
+
+// Наблюдаемое состояние маршрута, а не догадка о сборке: «расширение не подключено» (спрашивать
+// некого), «возможность не объявлена» (подключённая сборка или первичный процесс её не несут) и
+// «ответ не той формы» — разные наблюдения. Всё, что осталось неопознанным, остаётся unknown.
+const EXTENSION_SNAPSHOT_FAILURES = Object.freeze({
+    EXTENSION_DISCONNECTED: { state: 'not_checked', source: 'device_process', cause: 'unavailable' },
+    UNSUPPORTED_CAPABILITY: { state: 'unsupported', source: 'extension', cause: 'unsupported' },
+    EXTENSION_DIAGNOSTIC_INVALID: { state: 'failed', source: 'extension', cause: 'corrupt' },
+});
+const extensionSnapshotFailure = (code) => EXTENSION_SNAPSHOT_FAILURES[code] ?? { state: 'failed', source: 'extension', cause: 'unknown' };
 const step = (operation, state, systemCode, reason) => ({ operation, state, ...(systemCode ? { systemCode } : {}), ...(reason ? { reason } : {}) });
 
 const probeStorageTarget = async (name, target, { observedAt, randomUUID, fileSystem }) => {
@@ -97,8 +107,7 @@ export const collectDiagnosis = async (/** @type {any} */ { scope, mode, operati
                     ? diagnosticCheck({ check: 'extension_snapshot', state: 'passed', observedAt: facts.observedAt, source: 'extension', executionPlane: 'device', facts })
                     : diagnosticCheck({ check: 'extension_snapshot', state: 'unsupported', observedAt, source: 'capability_negotiation', executionPlane: 'device', cause: 'unsupported' }));
             } catch (error) {
-                checks.push(diagnosticCheck({ check: 'extension_snapshot', state: error?.code === 'UNSUPPORTED_CAPABILITY' ? 'unsupported' : 'failed', observedAt,
-                    source: 'extension', executionPlane: 'device', cause: error?.code === 'UNSUPPORTED_CAPABILITY' ? 'unsupported' : 'unknown' }));
+                checks.push(diagnosticCheck({ check: 'extension_snapshot', ...extensionSnapshotFailure(error?.code), observedAt, executionPlane: 'device' }));
             }
         }
     }
